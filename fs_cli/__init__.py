@@ -1,0 +1,1 @@
+"""Freshsales CLI."""
