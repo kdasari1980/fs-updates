@@ -6,8 +6,8 @@ import tempfile
 import unittest
 
 from fs_cli import cli
-from fs_cli.client import FSError, load_api_key
-from tests.fakes import FakeResponse, Seq, make_client
+from fs_cli.client import Client, FSError, load_api_key
+from tests.fakes import FakeResponse, FakeSession, Seq, make_client
 
 CONTACT_FIELDS = {"fields": [
     {"name": "cf_rereachout", "label": "Re-reachout", "type": "dropdown",
@@ -51,6 +51,20 @@ class TestConfig(unittest.TestCase):
     def test_missing(self):
         with self.assertRaises(FSError):
             load_api_key({}, env_files=[])
+
+    def test_proxy_mode_needs_no_key(self):
+        self.assertIsNone(load_api_key({"FS_AUTH_VIA_PROXY": "1", "FS_API_KEY": "abc"}, env_files=[]))
+
+    def test_proxy_mode_sends_no_auth_header(self):
+        session = FakeSession({("GET", "x"): {"ok": True}})
+        client = Client(None, session=session)
+        self.assertNotIn("Authorization", session.headers)
+        self.assertEqual(client.get("x"), {"ok": True})
+
+    def test_proxy_mode_401_hint(self):
+        client = Client(None, session=FakeSession({("GET", "x"): FakeResponse(401, {})}))
+        with self.assertRaisesRegex(FSError, "network secret"):
+            client.get("x")
 
     def test_auth_header(self):
         client, session = make_client({})

@@ -16,6 +16,20 @@ echo 'FS_API_KEY=your-key-here' > .env   # .env is gitignored
 ./fs picklists                            # quick connectivity check
 ```
 
+### Claude Code cloud sessions (network secret)
+
+In a Claude Code cloud environment, store the key as a **network secret** rather than an
+environment variable, because environment variables are readable by anyone using the environment:
+
+- Allowed websites: `tern.freshworks.com`
+- Custom header: name `Authorization`, prefix **cleared**, value `Token token=<your key>`
+- Environment variable (not secret): `FS_AUTH_VIA_PROXY=1`
+
+With `FS_AUTH_VIA_PROXY=1`, `fs` sends no `Authorization` header and the proxy attaches it.
+A 401 in this mode points at the network secret.
+
+### Local use
+
 The key is read from `FS_API_KEY` in the environment first, then from `.env` in the current
 directory or the repo directory. It is only sent in the `Authorization: Token token=...` header
 and is never printed.

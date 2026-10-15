@@ -2,6 +2,10 @@
 
 The API key is only ever placed in the Authorization header; it is never
 logged, echoed or included in error messages.
+
+With FS_AUTH_VIA_PROXY=1 the client sends no Authorization header at all and
+relies on an outbound proxy (e.g. a Claude Code cloud "network secret") to
+attach it.
 """
 import os
 import sys
@@ -31,8 +35,15 @@ def _env_file_candidates():
     return [Path.cwd() / ".env", here / ".env"]
 
 
+def _truthy(value):
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def load_api_key(environ=None, env_files=None):
+    """Return the API key, or None when auth is delegated to a proxy."""
     environ = os.environ if environ is None else environ
+    if _truthy(environ.get("FS_AUTH_VIA_PROXY")):
+        return None
     key = (environ.get("FS_API_KEY") or "").strip()
     if key:
         return key
@@ -52,7 +63,8 @@ def load_api_key(environ=None, env_files=None):
                 value = value.strip().strip('"').strip("'")
                 if value:
                     return value
-    raise FSError("FS_API_KEY is not set (set the env var or add it to a .env file)")
+    raise FSError("FS_API_KEY is not set (set the env var or add it to a .env file, "
+                  "or set FS_AUTH_VIA_PROXY=1 if a proxy injects the Authorization header)")
 
 
 def _body_snippet(resp, limit=300):
@@ -64,12 +76,11 @@ class Client:
     def __init__(self, api_key, base_url=BASE_URL, session=None, sleep=time.sleep):
         self.base_url = base_url
         self.sleep = sleep
+        self.via_proxy = api_key is None
         self.session = session or requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Token token={api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        })
+        self.session.headers.update({"Content-Type": "application/json", "Accept": "application/json"})
+        if not self.via_proxy:
+            self.session.headers["Authorization"] = f"Token token={api_key}"
 
     def _retry_wait(self, resp, attempt):
         retry_after = resp.headers.get("Retry-After")
@@ -103,6 +114,10 @@ class Client:
             print(f"HTTP 429 rate limited; retry {attempt}/{MAX_RETRIES} in {wait:g}s", file=sys.stderr)
             self.sleep(wait)
 
+        if resp.status_code == 401 and self.via_proxy:
+            raise FSError(f"{method} {path}: HTTP 401 unauthorised. FS_AUTH_VIA_PROXY is set, so check the "
+                          "network secret for tern.freshworks.com (header Authorization, "
+                          "value 'Token token=<key>', no prefix)")
         if resp.status_code == 404:
             raise NotFound(f"{method} {path}: not found (HTTP 404)")
         if resp.status_code >= 400:
