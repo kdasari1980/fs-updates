@@ -32,3 +32,7 @@ Creates: `create-contact --preset target-contact --set first_name=Zed --set emai
 `create-account --preset advisor-account --set name=X --set 'cf_type=SO-CF;AD-A&T' --apply`. The fake keeps what POST creates (ids from 60).
 
 Gotcha: `pkill -f fake_fs.py` from the same shell line can kill that shell (exit 144); use `kill %1`.
+
+Step 2 flows: `add-note 5 "x" --on deal --apply`, `add-note 100 "x" --on account --apply`,
+`link-deal-contacts 5 --add 12 --remove 11` dry-run then `--apply` (the fake appends and removes like the
+live API; deal 5 starts with contact 11), `update-contact 11 --set cf_rereachout=Chase --set owner="Joanna Te"`.

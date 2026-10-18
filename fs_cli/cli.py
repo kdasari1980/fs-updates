@@ -110,7 +110,9 @@ def _collect_ops(args, op):
     if op == "add-note":
         if args.text is None:
             raise FSError("add-note needs the note text")
-        return [{"id": args.id, "text": args.text}]
+        return [{"id": args.id, "text": args.text, "on": args.on}]
+    if op == "link-deal-contacts":
+        return [{"id": args.id, "add": args.add, "remove": args.remove}]
     return [{"id": args.id, "set": writes.parse_sets(args.set)}]
 
 
@@ -128,7 +130,11 @@ def _plan(ctx, op, item):
         if not isinstance(sets, dict):
             raise FSError(f"{op} {item['id']}: 'set' must be an object")
         return writes.plan_update_deal(ctx, item["id"], {k: str(v) for k, v in sets.items()})
-    return writes.plan_add_note(ctx, item["id"], item.get("text"))
+    if op == "link-deal-contacts":
+        def ids(v):
+            return ",".join(str(x) for x in v) if isinstance(v, list) else v
+        return writes.plan_link_deal_contacts(ctx, item["id"], ids(item.get("add")), ids(item.get("remove")))
+    return writes.plan_add_note(ctx, item["id"], item.get("text"), item.get("on") or "contact")
 
 
 def run_write(client, args, op):
@@ -201,10 +207,19 @@ def build_parser():
                        help="skill defaults, shown in the diff as 'default'; --set overrides them")
         s.add_argument("--batch", metavar="FILE", help='JSON list of {"set": {...}, "preset": "..."}')
         s.add_argument("--apply", action="store_true", help="actually write")
-    s = sub.add_parser("add-note", help="add a note to a contact (dry-run unless --apply)")
+    s = sub.add_parser("add-note", help="add a note to a contact, deal or account (dry-run unless --apply)")
     s.add_argument("id", nargs="?")
     s.add_argument("text", nargs="?")
-    s.add_argument("--batch", metavar="FILE", help="JSON list of {id, text} operations")
+    s.add_argument("--on", choices=sorted(writes.NOTE_TARGETS), default="contact",
+                   help="what the id is (default: contact)")
+    s.add_argument("--batch", metavar="FILE", help='JSON list of {"id", "text", "on"} operations')
+    s.add_argument("--apply", action="store_true", help="actually write")
+    s = sub.add_parser("link-deal-contacts",
+                       help="add and/or remove contacts on a deal (dry-run unless --apply)")
+    s.add_argument("id", nargs="?", help="deal id")
+    s.add_argument("--add", metavar="IDS", help="contact ids to link, comma-separated")
+    s.add_argument("--remove", metavar="IDS", help="contact ids to unlink, comma-separated")
+    s.add_argument("--batch", metavar="FILE", help='JSON list of {"id", "add": [...], "remove": [...]}')
     s.add_argument("--apply", action="store_true", help="actually write")
     return p
 

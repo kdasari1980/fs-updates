@@ -89,8 +89,12 @@ When you're happy with the diff, re-run the same command with `--apply`. That wi
 2. Send the PUT or POST.
 3. Re-read the record and print a `field / intended / actual` table. It exits 1 if any field did not take.
 
-Supported contact keys: `first_name`, `last_name`, `job_title`, `mobile_number`, `linkedin`, `city`,
-`sales_account` (exact existing account name; errors if there is no match or more than one match), plus the three `cf_` picklists above.
+Supported contact keys: `first_name`, `last_name`, `job_title`, `mobile_number`, `work_number`, `linkedin`, `city`,
+`country`, `address`, `state`, `zipcode`, `owner` (name or id), `sales_account` (exact existing account name; errors if
+there is no match or more than one match), and **any `cf_*` custom field**. Custom fields are checked by type:
+dropdowns against their choices, multi-selects value by value (`A;B`, order doesn't matter), checkboxes `true`/`false`,
+numbers, `YYYY-MM-DD` dates and free text. `auto_complete` fields (such as `cf_reports_to`) are rejected.
+Email changes are not supported yet.
 Setting `sales_account` makes that account primary and keeps the contact's existing accounts as
 non-primary. The full list is sent because the API docs don't say whether a PUT replaces
 the existing links. `key=` (an empty value) clears a field.
@@ -98,14 +102,25 @@ the existing links. `key=` (an empty value) clears a field.
 ```bash
 ./fs add-note 70001234567 "Met at conference; follow up in Q1"          # dry-run
 ./fs add-note 70001234567 "Met at conference; follow up in Q1" --apply
+./fs add-note 70009876543 "Teaser received" --on deal --apply            # --on contact (default) | deal | account
 ```
+
+```bash
+./fs link-deal-contacts 70009876543 --add 70001234567,70001234568 --remove 70001234569    # dry-run
+./fs link-deal-contacts 70009876543 --add 70001234567 --apply
+```
+Adds and/or removes contacts on a deal. Only the changes are sent: on the live API `contacts_added_list`
+**appends** (ids already linked are harmless) and `contacts_removed_list` removes. Contacts must exist,
+a contact in both lists is an error, and removing one that isn't linked is a warning. After applying, the deal's
+contacts are read back and must equal the intended final set exactly. A warning is printed if the deal
+would be left with no contacts. (The Zapier action replaced the whole list. The API does not.)
 
 ```bash
 ./fs update-deal 70009876543 --set deal_stage="LOI" --set amount=2500000 --set cf_some_field=value
 ```
 Supported deal keys: `name`, `amount`, `expected_close`, `probability`, `deal_stage` (by stage
-name, resolved within the deal's pipeline), `sales_account` (exact name), and any `cf_*` field
-that exists on deals. Dropdown values are validated.
+name, resolved within the deal's pipeline), `owner` (name or id), `sales_account` (exact name), and any `cf_*` field
+that exists on deals, checked by type like contact custom fields. Use `link-deal-contacts` to change a deal's contacts.
 
 ### Create commands
 
@@ -169,7 +184,14 @@ invalid, **nothing** is sent.
 ./fs add-note --batch notes.json                      # [{"id": 1, "text": "..."}]
 ./fs update-deal --batch deals.json                   # [{"id": 1, "set": {...}}]
 ```
-An item may carry `"op"`. If it does, it must match the command.
+An item may carry `"op"`. If it does, it must match the command. `add-note` items may carry `"on"`
+(`contact`, `deal` or `account`), and `link-deal-contacts` items look like `{"id": 1, "add": [2, 3], "remove": [4]}`.
+
+### Formats Freshsales changes on read-back
+
+Verification treats these as matches: dates come back as `2026-11-01T00:00:00+00:00` for a saved `2026-11-01`,
+and phone numbers come back with the spaces removed (`020 0000 0000` becomes `02000000000`). Both were found
+by checking the real API. The diff also treats them as unchanged, so re-running a command shows no changes.
 
 ## Rate limits
 
@@ -195,7 +217,8 @@ Checked against https://developers.freshworks.com/crm/api/:
 | Fields/picklists | `GET settings/{contacts,sales_accounts,deals}/fields` (`choices[].value`) |
 | Deal stages | `GET selector/deal_stages` |
 | Create | `POST contacts` / `POST deals` / `POST sales_accounts` `{"contact": {...}}`, read back with `GET <path>/{id}?include=...` |
-| Note | `POST notes` `{"note": {"description", "targetable_type": "Contact", "targetable_id"}}` |
+| Deal contacts | `GET deals/{id}?include=contacts`, `PUT deals/{id}` `{"deal": {"contacts_added_list": [...], "contacts_removed_list": [...]}}` |
+| Note | `POST notes` `{"note": {"description", "targetable_type": "Contact" or "Deal" or "SalesAccount", "targetable_id"}}`, read back with `GET <path>/{id}?include=notes` |
 
 The docs don't say where included associations appear in the response (inside the record or at the
 top level). The parser accepts both.

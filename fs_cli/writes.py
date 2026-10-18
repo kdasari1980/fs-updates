@@ -6,14 +6,18 @@ plan's payload, re-reads the record and checks every intended field took.
 """
 import re
 
-from . import reads
-from .client import FSError
+from . import reads, values
+from .client import FSError, NotFound
 
-CONTACT_STANDARD = ("first_name", "last_name", "job_title", "mobile_number", "linkedin", "city")
-CONTACT_CUSTOM = reads.PICKLIST_FIELDS
+CONTACT_STANDARD = ("first_name", "last_name", "job_title", "mobile_number", "work_number", "linkedin",
+                    "city", "country", "address", "state", "zipcode")
 CONTACT_ACCOUNT_KEYS = ("sales_account", "account")
 DEAL_STANDARD = ("name", "amount", "expected_close", "probability")
 NUMERIC_FIELDS = ("amount", "probability")
+# note target -> (settings/path name, targetable_type, record key in responses)
+NOTE_TARGETS = {"contact": ("contacts", "Contact", "contact"),
+                "deal": ("deals", "Deal", "deal"),
+                "account": ("sales_accounts", "SalesAccount", "sales_account")}
 
 
 class Context:
@@ -53,11 +57,19 @@ def _empty(v):
     return v is None or (isinstance(v, str) and v.strip() == "") or v == []
 
 
+PHONE_FIELDS = ("mobile_number", "work_number")
+DATE_FIELDS = ("expected_close",)
+
+
 def same(field, a, b):
     if _empty(a) and _empty(b):
         return True
     if _empty(a) or _empty(b):
         return False
+    if field in PHONE_FIELDS:
+        return values.compare("phone", b, a)
+    if field in DATE_FIELDS:
+        return values.compare("date", b, a)
     if field in NUMERIC_FIELDS:
         try:
             return float(a) == float(b)
@@ -79,16 +91,50 @@ def _change(field, before, after, display_before=None, display_after=None):
     }
 
 
-def _validate_picklist(ctx, entity, field, value, errors):
-    if _empty(value):
+def _typed_change(field, before, payload_value, kind, expected):
+    changed = not values.compare(kind, expected, before)
+    had_value = bool(before) if kind == "bool" else not _empty(before)  # an unticked box is not a value
+    return {"field": field, "before": before, "after": payload_value, "changed": changed,
+            "overwrites_existing": changed and had_value}
+
+
+def _custom_update(ctx, entity, fields_entity, key, value, current_custom, errors, changes, custom, checks):
+    """Shared cf_* handling for contacts and deals: validate by field type, diff kind-aware."""
+    before = current_custom.get(key)
+    if _empty(value):  # `key=` clears the field
+        if fields_entity and ctx.fields(fields_entity).get(key) is None:
+            errors.append(f"{key}: no such custom field on {entity}")
+            return
+        ch = _change(key, before, "")
+        changes.append(ch)
+        if ch["changed"]:
+            custom[key] = ""
+            checks.append(("cf", key, ""))
         return
-    meta = ctx.fields(entity).get(field)
-    if meta is None:
-        errors.append(f"{field}: no such field on {entity}")
+    res = values.custom(ctx, fields_entity, key, value, errors, entity)
+    if res is None:
         return
-    valid = reads.choice_values(meta)
-    if valid and value not in valid:
-        errors.append(f"{field}: {value!r} is not a valid picklist value. Valid: {valid}")
+    pvalue, kind, expected = res
+    ch = _typed_change(key, before, pvalue, kind, expected)
+    changes.append(ch)
+    if ch["changed"]:
+        custom[key] = pvalue
+        checks.append(("cf", key, pvalue, kind, expected))
+
+
+def _owner_update(ctx, entity, fields_entity, value, current, errors, changes, payload, checks):
+    oid = values.choice(ctx, fields_entity, "owner_id", value, errors, entity)
+    if oid is None:
+        return
+    before = current.get("owner_id")
+    name = values.choice_name(ctx, fields_entity, "owner_id", oid)
+    ch = _change("owner_id", before, oid,
+                 values.choice_name(ctx, fields_entity, "owner_id", before) if before else None,
+                 f"{name} ({oid})")
+    changes.append(ch)
+    if ch["changed"]:
+        payload["owner_id"] = oid
+        checks.append(("std", "owner_id", oid))
 
 
 # ---------- plans ----------
@@ -106,13 +152,11 @@ def plan_update_contact(ctx, contact_id, sets):
             if ch["changed"]:
                 payload[key] = value
                 checks.append(("std", key, value))
-        elif key in CONTACT_CUSTOM:
-            _validate_picklist(ctx, "contacts", key, value, errors)
-            ch = _change(key, current["custom_field"].get(key), value)
-            changes.append(ch)
-            if ch["changed"]:
-                custom[key] = value
-                checks.append(("cf", key, value))
+        elif key.startswith("cf_"):
+            _custom_update(ctx, "contact", "contacts", key, value, current["custom_field"],
+                           errors, changes, custom, checks)
+        elif key in ("owner", "owner_id"):
+            _owner_update(ctx, "contact", "contacts", value, current, errors, changes, payload, checks)
         elif key in CONTACT_ACCOUNT_KEYS:
             existing = current["sales_accounts"]
             before_names = [a.get("name") for a in existing]
@@ -143,7 +187,7 @@ def plan_update_contact(ctx, contact_id, sets):
             checks.append(("account", "sales_account", target))
         else:
             errors.append(f"{key}: not a supported contact field. Supported: "
-                          f"{list(CONTACT_STANDARD) + list(CONTACT_CUSTOM) + ['sales_account']}")
+                          f"{list(CONTACT_STANDARD) + ['owner', 'sales_account', 'cf_*']}")
 
     if custom:
         payload["custom_field"] = custom
@@ -156,20 +200,96 @@ def plan_update_contact(ctx, contact_id, sets):
     }
 
 
-def plan_add_note(ctx, contact_id, text):
+def _note_label(ctx, on, record_id):
+    if on == "contact":
+        return reads.get_contact(ctx.client, record_id).get("display_name")
+    if on == "deal":
+        return reads.get_deal(ctx.client, record_id).get("name")
+    return reads.get_account_basic(ctx.client, record_id).get("name")
+
+
+def plan_add_note(ctx, record_id, text, on="contact"):
+    if on not in NOTE_TARGETS:
+        raise FSError(f"add-note --on must be one of {sorted(NOTE_TARGETS)}, got {on!r}")
     if _empty(text):
         raise FSError("add-note needs non-empty text")
-    current = reads.get_contact(ctx.client, contact_id)
+    _, targetable_type, _ = NOTE_TARGETS[on]
+    label = _note_label(ctx, on, record_id)
     return {
-        "op": "add-note", "entity": "contact", "id": contact_id,
-        "label": current.get("display_name"),
+        "op": "add-note", "entity": on, "id": record_id, "label": label,
         "changes": [_change("note (new)", None, text)],
-        "errors": [],
+        "errors": [], "warnings": [],
         "request": {"method": "POST", "path": "notes",
-                    "body": {"note": {"description": text, "targetable_type": "Contact",
-                                      "targetable_id": int(contact_id) if str(contact_id).isdigit()
-                                      else contact_id}}},
+                    "body": {"note": {"description": text, "targetable_type": targetable_type,
+                                      "targetable_id": int(record_id) if str(record_id).isdigit()
+                                      else record_id}}},
         "_checks": [("note", "note", text)],
+    }
+
+
+def _id_list(raw, what, errors):
+    out = []
+    for part in values.split(raw or ""):
+        if not part.isdigit():
+            errors.append(f"{what}: {part!r} is not a contact id")
+        elif int(part) not in out:
+            out.append(int(part))
+    return out
+
+
+def plan_link_deal_contacts(ctx, deal_id, add, remove):
+    """Add and/or remove contacts on a deal.
+
+    On the live API `contacts_added_list` appends (ids already linked are harmless) and
+    `contacts_removed_list` removes, so only the changes are sent, not the whole list.
+    """
+    errors, warnings, changes, checks = [], [], [], []
+    add_ids, remove_ids = _id_list(add, "add", errors), _id_list(remove, "remove", errors)
+    if not add_ids and not remove_ids and not errors:
+        raise FSError("link-deal-contacts needs --add and/or --remove (comma-separated contact ids)")
+    both = sorted(set(add_ids) & set(remove_ids))
+    if both:
+        errors.append(f"contacts {both} are in both --add and --remove")
+    deal = reads.get_deal(ctx.client, deal_id)
+    linked = reads.deal_contacts(ctx.client, deal_id)
+    names = {c["id"]: c.get("display_name") for c in linked}
+    linked_ids = [c["id"] for c in linked]
+
+    to_add, to_remove = [], []
+    for cid in add_ids:
+        if cid in linked_ids:
+            changes.append(_change(f"contact {cid}", "linked", "linked", f"linked ({names[cid]})",
+                                   f"linked ({names[cid]})"))
+            continue
+        try:
+            name = reads.get_contact(ctx.client, cid).get("display_name")
+        except NotFound:
+            errors.append(f"add: contact {cid} does not exist")
+            continue
+        to_add.append(cid)
+        changes.append(_change(f"contact {cid}", None, "linked", "(not linked)", f"linked ({name})"))
+    for cid in remove_ids:
+        if cid not in linked_ids:
+            warnings.append(f"remove: contact {cid} is not linked to this deal; nothing to remove")
+            continue
+        to_remove.append(cid)
+        ch = _change(f"contact {cid}", "linked", None, f"linked ({names[cid]})", "(removed)")
+        ch["overwrites_existing"] = True
+        changes.append(ch)
+
+    final = [c for c in linked_ids + to_add if c not in to_remove]
+    if not final and (to_add or to_remove):
+        warnings.append("the deal would be left with no contacts")
+    body = {}
+    if to_add:
+        body["contacts_added_list"] = to_add
+    if to_remove:
+        body["contacts_removed_list"] = to_remove
+    return {
+        "op": "link-deal-contacts", "entity": "deal", "id": deal_id, "label": deal.get("name"),
+        "changes": changes, "errors": errors, "warnings": warnings,
+        "request": {"method": "PUT", "path": f"deals/{deal_id}", "body": {"deal": body}} if body else None,
+        "_checks": [("contacts_exact", "contacts", final)],
     }
 
 
@@ -227,18 +347,13 @@ def plan_update_deal(ctx, deal_id, sets):
                 payload["sales_account_id"] = target["id"]
                 checks.append(("std", "sales_account_id", target["id"]))
         elif key.startswith("cf_"):
-            if key not in ctx.fields("deals"):
-                errors.append(f"{key}: no such custom field on deals")
-                continue
-            _validate_picklist(ctx, "deals", key, value, errors)
-            ch = _change(key, current["custom_field"].get(key), value)
-            changes.append(ch)
-            if ch["changed"]:
-                custom[key] = value
-                checks.append(("cf", key, value))
+            _custom_update(ctx, "deal", "deals", key, value, current["custom_field"],
+                           errors, changes, custom, checks)
+        elif key in ("owner", "owner_id"):
+            _owner_update(ctx, "deal", "deals", value, current, errors, changes, payload, checks)
         else:
             errors.append(f"{key}: not a supported deal field. Supported: "
-                          f"{list(DEAL_STANDARD) + ['deal_stage', 'sales_account', 'cf_*']}")
+                          f"{list(DEAL_STANDARD) + ['deal_stage', 'owner', 'sales_account', 'cf_*']}")
 
     if custom:
         payload["custom_field"] = custom
@@ -260,10 +375,17 @@ def _strip_html(text):
 def _verify(ctx, plan, response):
     rows = []
     checks = plan["_checks"]
+    if plan["op"] == "link-deal-contacts":
+        actual = [c["id"] for c in reads.deal_contacts(ctx.client, plan["id"])]
+        want = checks[0][2]
+        return [{"field": "contacts", "intended": want, "actual": actual,
+                 "ok": values.compare("exact", want, actual)}]
+
     if plan["op"] == "add-note":
         note_id = ((response or {}).get("note") or {}).get("id")
-        data = ctx.client.get(f"contacts/{plan['id']}", params={"include": "notes"})
-        notes = reads._included(data, data.get("contact") or {}, "note", "notes")
+        path, _, key = NOTE_TARGETS[plan["entity"]]
+        data = ctx.client.get(f"{path}/{plan['id']}", params={"include": "notes"})
+        notes = reads._included(data, data.get(key) or {}, "note", "notes")
         found = next((n for n in notes if str(n.get("id")) == str(note_id)), None)
         intended = checks[0][2]
         row = {"field": "note", "intended": intended,
@@ -280,8 +402,13 @@ def _verify(ctx, plan, response):
         after = reads.get_contact(ctx.client, plan["id"])
     else:
         after = reads.get_deal(ctx.client, plan["id"])
-    for kind, field, intended in checks:
-        if kind == "std":
+    for chk in checks:
+        kind, field, intended = chk[:3]
+        if kind == "cf" and len(chk) > 3:
+            actual = after["custom_field"].get(field)
+            rows.append({"field": field, "intended": intended, "actual": actual,
+                         "ok": values.compare(chk[3], chk[4], actual)})
+        elif kind == "std":
             actual = after.get(field)
             rows.append({"field": field, "intended": intended, "actual": actual,
                          "ok": same(field, actual, intended)})

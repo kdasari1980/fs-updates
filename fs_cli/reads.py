@@ -2,7 +2,8 @@
 from .client import FSError, NotFound
 
 CONTACT_FIELDS = ("id", "display_name", "first_name", "last_name", "email", "job_title",
-                  "mobile_number", "linkedin", "city")
+                  "mobile_number", "work_number", "linkedin", "city", "country", "address", "state",
+                  "zipcode", "owner_id")
 PICKLIST_FIELDS = ("cf_rereachout", "cf_contact_type_newct", "cf_reachout_final_statustargets")
 FIELD_ENTITIES = ("contacts", "sales_accounts", "deals")
 
@@ -45,7 +46,7 @@ def _account_ref(acc):
 
 def get_contact(client, contact_id):
     """Return the contact summary dict (raises NotFound)."""
-    data = client.get(f"contacts/{contact_id}", params={"include": "sales_accounts"})
+    data = client.get(f"contacts/{contact_id}", params={"include": "sales_accounts,owner"})
     contact = data.get("contact") or {}
     if not contact:
         raise FSError(f"contacts/{contact_id}: empty response")
@@ -82,7 +83,7 @@ def contacts_by_email(client, email):
 # ---------- deals / accounts ----------
 
 def get_deal(client, deal_id):
-    data = client.get(f"deals/{deal_id}", params={"include": "sales_account,deal_stage"})
+    data = client.get(f"deals/{deal_id}", params={"include": "sales_account,deal_stage,owner"})
     deal = data.get("deal") or {}
     if not deal:
         raise FSError(f"deals/{deal_id}: empty response")
@@ -97,12 +98,23 @@ def get_deal(client, deal_id):
         "amount": deal.get("amount"),
         "deal_stage_id": deal.get("deal_stage_id"),
         "deal_pipeline_id": deal.get("deal_pipeline_id"),
+        "owner_id": deal.get("owner_id"),
         "stage": stage.get("name") if stage else None,
         "expected_close": deal.get("expected_close"),
         "probability": deal.get("probability"),
         "custom_field": deal.get("custom_field") or {},
         "sales_account": account,
     }
+
+
+def deal_contacts(client, deal_id):
+    """Contacts linked to a deal: [{id, display_name}, ...]."""
+    data = client.get(f"deals/{deal_id}", params={"include": "contacts"})
+    deal = data.get("deal") or {}
+    if not deal:
+        raise FSError(f"deals/{deal_id}: empty response")
+    return [{"id": c.get("id"), "display_name": c.get("display_name")}
+            for c in _included(data, deal, "contact", "contacts")]
 
 
 def get_account_basic(client, account_id):

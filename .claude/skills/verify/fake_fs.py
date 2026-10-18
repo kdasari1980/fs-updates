@@ -10,7 +10,7 @@ state = {
              "sales_accounts": [{"id": 100, "name": "Engines Ltd", "is_primary": True}]},
  "deal": {"id": 5, "name": "Engines deal", "amount": "100.0", "deal_stage_id": 9, "deal_pipeline_id": 1,
           "sales_account_id": 100, "custom_field": {}},
- "notes": [], "hits429": 0, "ignore_city": True,
+ "notes": [], "hits429": 0, "ignore_city": True, "deal_contacts": [11],
 }
 OWNERS = [{"id": 1, "value": "Karthik Dasari"}, {"id": 2, "value": "Joanna Te"}]
 FIELDS = {"fields": [
@@ -96,8 +96,11 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, {"contacts": {"contacts": hit}})
             if path == "contacts/11":
                 out = {"contact": c}
-                if q.get("include") == "notes": out["notes"] = state["notes"]
+                if q.get("include") == "notes": out["notes"] = [n for n in state["notes"] if n.get("on", "Contact") == "Contact"]
                 return self._send(200, out)
+            if path == "contacts/12":
+                return self._send(200, {"contact": {"id": 12, "display_name": "Bob Babbage", "first_name": "Bob", "last_name": "Babbage",
+                                                    "email": "bob@example.com", "custom_field": {}}})
             if path == "search":
                 hits = []
                 if "engines" in q.get("q", "").lower():
@@ -108,10 +111,15 @@ class H(BaseHTTPRequestHandler):
                     hits = [{"id": 9, "type": "sales_account", "name": "Not Qualified"}]
                 return self._send(200, hits)
             if path == "deals/5":
-                return self._send(200, {"deal": d, "deal_stages": [{"id": d["deal_stage_id"], "name": {9: "IM Received", 10: "LOI"}[d["deal_stage_id"]]}],
-                                        "sales_accounts": [{"id": 100, "name": "Engines Ltd"}]})
+                inc = q.get("include", "").split(",")
+                out = {"deal": d, "deal_stages": [{"id": d["deal_stage_id"], "name": {9: "IM Received", 10: "LOI"}[d["deal_stage_id"]]}],
+                       "sales_accounts": [{"id": 100, "name": "Engines Ltd"}]}
+                if "contacts" in inc: out["contacts"] = [{"id": i, "display_name": f"Contact {i}"} for i in state["deal_contacts"]]
+                if "notes" in inc: out["notes"] = [n for n in state["notes"] if n.get("on") == "Deal"]
+                return self._send(200, out)
             if path in ("sales_accounts/100",):
-                return self._send(200, {"sales_account": {"id": 100, "name": "Engines Ltd", "custom_field": {}},
+                return self._send(200, {"notes": [n for n in state["notes"] if n.get("on") == "SalesAccount"] if "notes" in q.get("include", "") else [],
+                                        "sales_account": {"id": 100, "name": "Engines Ltd", "custom_field": {}},
                                         "contacts": [{"id": 11, "display_name": c["display_name"], "email": c["email"]}],
                                         "deals": [{"id": 5, "name": d["name"], "amount": d["amount"], "deal_stage_id": d["deal_stage_id"]}]})
             if path == "selector/deal_stages":
@@ -122,14 +130,19 @@ class H(BaseHTTPRequestHandler):
             c["custom_field"].update(upd.pop("custom_field", {}))
             c.update(upd); return self._send(200, {"contact": c})
         if method == "PUT" and path == "deals/5":
-            d.update(body["deal"]); return self._send(200, {"deal": d})
+            upd = dict(body["deal"])
+            for i in upd.pop("contacts_added_list", []):            # append, like the live API
+                if i not in state["deal_contacts"]: state["deal_contacts"].append(i)
+            for i in upd.pop("contacts_removed_list", []):
+                if i in state["deal_contacts"]: state["deal_contacts"].remove(i)
+            d.update(upd); return self._send(200, {"deal": d})
         if method == "POST" and path in ("contacts", "deals", "sales_accounts"):
             key = {"contacts": "contact", "deals": "deal", "sales_accounts": "sales_account"}[path]
             rec = dict(body[key]); rec["id"] = next_id[0]; next_id[0] += 1
             created[path][rec["id"]] = rec
             return self._send(200, {key: {"id": rec["id"]}})
         if method == "POST" and path == "notes":
-            n = {"id": 77 + len(state["notes"]), "description": body["note"]["description"]}
+            n = {"id": 77 + len(state["notes"]), "description": body["note"]["description"], "on": body["note"]["targetable_type"]}
             state["notes"].append(n); return self._send(201, {"note": n})
         return self._send(404, {"errors": {"message": "not found"}})
     def do_GET(self): self.handle_any("GET")
