@@ -182,6 +182,49 @@ def run_write(client, args, op):
 
 # ---------- parser ----------
 
+def _run_views(client, args):
+    res = reads.list_views(client, args.entity)
+    _emit(res)
+    print("\n" + _table(["id", "name", "default"], [[v["id"], v["name"], v["is_default"]] for v in res]),
+          file=sys.stderr)
+    return EXIT_OK
+
+
+def _run_list_view(client, args):
+    fields = _split(args.fields) if args.fields else None
+    res = reads.list_view(client, args.entity, args.view_id, where=args.where, fields=fields,
+                          max_pages=args.max_pages)
+    _emit(res)
+    cols = list(res["rows"][0].keys()) if res["rows"] else []
+    if res["rows"]:
+        print("\n" + _table(cols, [[r[c] for c in cols] for r in res["rows"][:args.show]]), file=sys.stderr)
+    print(f"\n{res['matched']} matched of {res['rows_in_view']} in the view "
+          f"({res['pages_read']} of {res['pages_in_view']} pages read)", file=sys.stderr)
+    if res["truncated"]:
+        print(f"WARNING: stopped after {args.max_pages} pages; raise --max-pages to read the rest "
+              "(each page is one request of the account's 1000 an hour)", file=sys.stderr)
+    return EXIT_OK
+
+
+def _run_find_contacts(client, args):
+    res = reads.find_contacts(client, name=args.name, email=args.email, city=args.city, ctype=args.type,
+                              domain=args.domain)
+    cols = ("id", "display_name", "email", "job_title", "city", "country")
+    rows = [{c: r.get(c) for c in cols} for r in res["rows"]]
+    shown = rows[:args.limit]
+    out = {"total": res["total"], "returned": len(rows), "shown": len(shown), "contacts": shown,
+           "notes": res["notes"]}
+    if args.full:
+        out["contacts"] = [reads.get_contact(client, r["id"]) for r in shown]
+    _emit(out)
+    if shown:
+        print("\n" + _table(list(cols), [[r[c] for c in cols] for r in shown]), file=sys.stderr)
+    print(f"\n{res['total']} matched; showing {len(shown)}", file=sys.stderr)
+    for n in res["notes"]:
+        print(f"NOTE: {n}", file=sys.stderr)
+    return EXIT_OK
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="fs", description="Freshsales CLI (tern.freshworks.com)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -193,6 +236,25 @@ def build_parser():
     s = sub.add_parser("account", help="account plus linked contacts and deals")
     s.add_argument("account_id")
     sub.add_parser("picklists", help="valid values for the custom picklists")
+
+    s = sub.add_parser("views", help="list saved views (ids for list-view)")
+    s.add_argument("--entity", choices=sorted(reads.VIEW_ENTITIES), default="contacts")
+    s = sub.add_parser("list-view", help="read a saved view and filter its rows (whole records, 100 per request)")
+    s.add_argument("view_id")
+    s.add_argument("--entity", choices=sorted(reads.VIEW_ENTITIES), default="contacts")
+    s.add_argument("--where", action="append", metavar="FIELD=VALUE|FIELD~PART", default=[],
+                   help="= whole value, ~ part of it; ignores case; commas mean any-of; FIELD may be cf_* or domain")
+    s.add_argument("--fields", metavar="A,B,C", help="columns to return (row fields or cf_*)")
+    s.add_argument("--max-pages", type=int, default=10, help="pages of 100 to read (default 10)")
+    s.add_argument("--show", type=int, default=50, help="rows to print in the table on stderr (default 50)")
+    s = sub.add_parser("find-contacts", help="search contacts by name, email, city, type or email domain")
+    s.add_argument("--name", help='"First Last" (exact) or one word (part of the surname)')
+    s.add_argument("--email")
+    s.add_argument("--city", help="exact; commas mean any-of")
+    s.add_argument("--type", help="Contact Type picklist value; commas mean any-of")
+    s.add_argument("--domain", help="email domain, on its own; free-text search stops at 100 results")
+    s.add_argument("--limit", type=int, default=25, help="contacts to return (default 25)")
+    s.add_argument("--full", action="store_true", help="fetch each contact in full, with custom fields (one request each)")
 
     for name in ("update-contact", "update-deal"):
         s = sub.add_parser(name, help=f"{name} (dry-run unless --apply)")
@@ -239,6 +301,12 @@ def main(argv=None, client=None):
         if args.cmd == "account":
             _emit(reads.get_account(client, args.account_id))
             return EXIT_OK
+        if args.cmd == "views":
+            return _run_views(client, args)
+        if args.cmd == "list-view":
+            return _run_list_view(client, args)
+        if args.cmd == "find-contacts":
+            return _run_find_contacts(client, args)
         if args.cmd == "picklists":
             res = reads.picklists(client)
             _emit(res)

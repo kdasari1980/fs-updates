@@ -98,6 +98,11 @@ class H(BaseHTTPRequestHandler):
                 out = {"contact": c}
                 if q.get("include") == "notes": out["notes"] = [n for n in state["notes"] if n.get("on", "Contact") == "Contact"]
                 return self._send(200, out)
+            if path in ("contacts/filters", "deals/filters", "sales_accounts/filters"):
+                return self._send(200, {"filters": [{"id": 1, "name": "All " + path.split("/")[0].title(), "is_default": True, "is_public": True}]})
+            if path == "contacts/view/1":
+                rows = [dict(c, emails=[{"value": c["email"]}]) | {"owner_id": 1}]
+                return self._send(200, {"contacts": rows, "meta": {"total": len(rows), "total_pages": 1}})
             if path == "contacts/12":
                 return self._send(200, {"contact": {"id": 12, "display_name": "Bob Babbage", "first_name": "Bob", "last_name": "Babbage",
                                                     "email": "bob@example.com", "custom_field": {}}})
@@ -136,6 +141,15 @@ class H(BaseHTTPRequestHandler):
             for i in upd.pop("contacts_removed_list", []):
                 if i in state["deal_contacts"]: state["deal_contacts"].remove(i)
             d.update(upd); return self._send(200, {"deal": d})
+        if method == "POST" and path == "filtered_search/contact":
+            rows = [c]
+            for rule in body["filter_rule"]:
+                attr, val = rule["attribute"], str(rule["value"]).lower()
+                key = {"contact_email.email": "email"}.get(attr, attr)
+                rows = [r for r in rows if (rule["operator"] == "contains" and val in str(r.get(key, "")).lower())
+                        or (rule["operator"] == "is_in" and str(r.get(key, "")).strip().lower() in val.split(","))]
+            return self._send(200, {"contacts": [{k: r.get(k) for k in ("id", "display_name", "email", "job_title", "city")} for r in rows],
+                                    "meta": {"total": len(rows)}})
         if method == "POST" and path in ("contacts", "deals", "sales_accounts"):
             key = {"contacts": "contact", "deals": "deal", "sales_accounts": "sales_account"}[path]
             rec = dict(body[key]); rec["id"] = next_id[0]; next_id[0] += 1

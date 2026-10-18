@@ -46,7 +46,9 @@ class FakeSession:
         return FakeResponse(200, route)
 
     def writes(self):
-        return [c for c in self.calls if c[0] in ("PUT", "POST", "DELETE", "PATCH")]
+        # filtered_search is a POST but only reads
+        return [c for c in self.calls if c[0] in ("PUT", "POST", "DELETE", "PATCH")
+                and not c[1].startswith("filtered_search")]
 
 
 def make_client(routes):

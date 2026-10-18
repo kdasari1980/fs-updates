@@ -3,6 +3,7 @@
 Use `fs` for all Freshsales reads and writes. Always run without --apply first, show the diff to the user, and only apply after approval.
 
 - Run `./fs picklists` before writing picklist values; Freshsales silently ignores invalid ones.
+- Finding records: `find-contacts` (name/email/city/type, or `--domain` alone), `views` + `list-view` (whole records incl. custom fields; filter with `--where`). All read-only; mind the 1000 requests an hour.
 - Creates: `create-contact|deal|account`, dry-run first like every write. Use `--preset` for the skill defaults, and never create without checking the duplicate warnings in the dry-run. Multi-selects need `;`-joined values.
 - `update-contact` / `update-deal` take any `cf_*` field and `owner`; `add-note --on contact|deal|account`; `link-deal-contacts` adds/removes deal contacts (append and remove, never replace).
 - Delete and merge are deliberately not supported (both are permanent).

@@ -36,3 +36,8 @@ Gotcha: `pkill -f fake_fs.py` from the same shell line can kill that shell (exit
 Step 2 flows: `add-note 5 "x" --on deal --apply`, `add-note 100 "x" --on account --apply`,
 `link-deal-contacts 5 --add 12 --remove 11` dry-run then `--apply` (the fake appends and removes like the
 live API; deal 5 starts with contact 11), `update-contact 11 --set cf_rereachout=Chase --set owner="Joanna Te"`.
+
+Search flows (read-only): `views`, `views --entity deals`, `list-view 1 --where city~London`,
+`find-contacts --name "Ada Lovelace"`, `find-contacts --name Love`, `find-contacts --city London --type ...`.
+The fake only has contact 11 (Ada, London). `POST filtered_search/contact` is a read, so it may appear in the
+request log on a dry-run.

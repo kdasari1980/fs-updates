@@ -59,6 +59,30 @@ The account record plus its linked contacts and deals.
 ```
 Valid values for `cf_rereachout`, `cf_contact_type_newct` and `cf_reachout_final_statustargets`.
 
+```bash
+./fs find-contacts --name "Richard Boyden"        # "First Last" is exact; one word is part of the surname
+./fs find-contacts --city "Reading,Oxford" --type SO-CF --limit 50
+./fs find-contacts --email richard.boyden@frpadvisory.com
+./fs find-contacts --domain frpadvisory.com       # on its own: free-text search, stops at 100 results
+./fs find-contacts --city Reading --full          # each contact in full, with custom fields (one request each)
+```
+Server-side search. Filters are ANDed, matching ignores case, and commas mean any-of (`Reading,Oxford`). Names,
+city and email match whole values (a single word searches part of the surname). `--type` is checked against the
+Contact Type picklist. Results carry id, name, email, job title, city and country but **no custom fields**; use
+`--full`, `lookup`, or `list-view` for those. Output says how many matched in total if more were returned than shown.
+
+```bash
+./fs views                                  # saved views; --entity deals | accounts
+./fs list-view 13000351421 --where "cf_contact_type_newct=SO-CF" --where "city~Reading" --max-pages 5
+./fs list-view 13000351421 --where domain=frpadvisory.com --fields id,display_name,cf_rereachout,cf_reachout_priority
+```
+Reads a saved view page by page (100 rows a request) and filters the rows here, so you can filter on **any field,
+including custom fields**. `field=value` matches a whole value, `field~part` matches part of it, both ignore case,
+commas mean any-of, and `domain=` matches the email domain exactly (secondary emails too). Default columns are
+id, name, email, job title, city and the Contact Type, Reachout Status, Priority and Final Status fields. The report
+says how many pages were read and warns if `--max-pages` stopped it early. Each page counts against the account's
+1000 requests an hour, and the All Contacts view is about 74 pages.
+
 ## Write commands (dry-run by default)
 
 Without `--apply`, a write command reads the current record and prints a before/after diff.
@@ -210,6 +234,8 @@ Checked against https://developers.freshworks.com/crm/api/:
 | Purpose | Call |
 |---|---|
 | Email lookup | `GET lookup?q=<email>&f=email&entities=contact` |
+| Contact search | `POST filtered_search/contact?per_page=100` `{"filter_rule": [{"attribute", "operator": "is_in" or "contains", "value"}]}` (a read, ANDed; `contains` works on `last_name` only); domain via `GET search?q=<domain>&include=contact` |
+| Saved views | `GET {contacts,deals,sales_accounts}/filters`, `GET <path>/view/{id}?page=&per_page=100` (whole records incl. `custom_field`) |
 | Contact | `GET contacts/{id}?include=sales_accounts`, `PUT contacts/{id}` `{"contact": {..., "custom_field": {...}, "sales_accounts": [{"id", "is_primary"}]}}` |
 | Search | `GET search?q=<term>&include=deal,sales_account&per_page=100` |
 | Deal | `GET deals/{id}?include=sales_account,deal_stage`, `PUT deals/{id}` `{"deal": {...}}` |
