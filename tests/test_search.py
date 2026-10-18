@@ -82,7 +82,7 @@ class TestListView(unittest.TestCase):
         code, out, err, session = self.run_view("--max-pages", "1")
         self.assertEqual((out["pages_read"], out["truncated"], out["matched"]), (1, True, 2))
         self.assertEqual(len(session.calls), 1)
-        self.assertIn("WARNING: stopped after 1 pages", err)
+        self.assertIn("WARNING: stopped early (reached --max-pages 1)", err)
 
     def test_bad_where(self):
         for bad in ("nonsense", "=x", "city="):

@@ -14,12 +14,12 @@ Behaviour confirmed against the live API with throwaway records:
 """
 import re
 
+from . import checks as rules
 from . import reads, values
 from .client import FSError, NotFound
 from .writes import _change, _empty
 
 WEB_BASE = "https://tern.freshworks.com/crm/sales/"
-EMAIL_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
 
 ENTITIES = {
     "contact": {
@@ -124,7 +124,7 @@ def plan_create(ctx, entity, sets, preset=None):
         source = "set" if key in user else "default"
         if key in ("email", "emails") and entity == "contact":
             emails = values.split(value)
-            bad = [e for e in emails if not EMAIL_RE.match(e)]
+            bad = [e for e in emails if not values.EMAIL_RE.match(e)]
             if bad or not emails:
                 errors.append(f"emails: not a valid email address: {bad or [value]}")
                 continue
@@ -231,6 +231,10 @@ def plan_create(ctx, entity, sets, preset=None):
     if not errors:
         _check_duplicates(ctx, entity, payload, errors, warnings)
 
+    if entity == "contact":
+        warnings.extend(m for _, m in rules.contact_issues({
+            "custom_field": payload.get("custom_field"), "city": payload.get("city"),
+            "linkedin": payload.get("linkedin"), "emails": payload.get("emails")}))
     label = {"contact": " ".join(str(payload.get(k, "")) for k in ("first_name", "last_name")).strip(),
              "deal": payload.get("name"), "account": payload.get("name")}[entity]
     return {
@@ -239,6 +243,17 @@ def plan_create(ctx, entity, sets, preset=None):
         "request": {"method": "POST", "path": spec["path"], "body": {spec["key"]: payload}},
         "_checks": checks,
     }
+
+
+def prefetch_duplicates(ctx, emails):
+    """Find existing contacts for every email in a batch with one search per 25 emails, instead of one
+    lookup per contact. The per-contact duplicate check then reads from this."""
+    wanted = sorted({e.strip().lower() for e in emails if e and e.strip()} - ctx.email_checked)
+    if not wanted:
+        return
+    for email, hits in reads.contacts_by_emails(ctx.client, wanted).items():
+        ctx.email_hits[email] = hits
+    ctx.email_checked.update(wanted)
 
 
 def _check_required(entity, payload, errors):
@@ -264,7 +279,11 @@ def _check_duplicates(ctx, entity, payload, errors, warnings):
                 errors.append(f"duplicate: {email} appears more than once in this batch")
                 continue
             seen.add(email)
-            for hit in reads.contacts_by_email(ctx.client, item["value"]):
+            if email in ctx.email_checked:
+                hits = ctx.email_hits.get(email, [])
+            else:
+                hits = reads.contacts_by_email(ctx.client, item["value"])
+            for hit in hits:
                 errors.append(f"duplicate: {item['value']} already exists as contact {hit.get('id')} "
                               f"({hit.get('display_name')}). Use update-contact instead")
         return
@@ -320,12 +339,12 @@ def _first_id(data, *keys):
     return None
 
 
-def _fetch_after(ctx, entity, new_id):
+def _extract_after(entity, data):
+    """The saved record and its included extras, from a GET or from a POST/PUT made with ?include=."""
     spec = ENTITIES[entity]
-    data = ctx.client.get(f"{spec['path']}/{new_id}", params={"include": spec["include"]})
     rec = data.get(spec["key"]) or {}
     if not rec:
-        raise FSError(f"{spec['path']}/{new_id}: empty response on read-back")
+        return None
     x = {}
     if entity == "contact":
         x["sales_account_ids"] = [a.get("id") for a in
@@ -340,19 +359,54 @@ def _fetch_after(ctx, entity, new_id):
     return {"rec": rec, "cf": rec.get("custom_field") or {}, "x": x}
 
 
+def _complete(data, after, checks):
+    """True when the response has everything the checks look at, so no second call is needed."""
+    if after is None:
+        return False
+    rec = after["rec"]
+    for chk in checks:
+        where, field = chk["where"]
+        if where == "cf" and "custom_field" not in rec:
+            return False
+        if where == "x":
+            if field in ("lifecycle_stage_id", "contact_status_id", "currency_id") and after["x"].get(field) is None:
+                return False
+            if field == "emails" and "emails" not in rec:
+                return False
+            if field == "sales_account_ids" and "sales_accounts" not in rec and "sales_accounts" not in data:
+                return False
+            if field == "contact_ids" and "contacts" not in rec and "contacts" not in data:
+                return False
+    return True
+
+
+def _fetch_after(ctx, entity, new_id):
+    """Fallback: read the new record back (one extra call)."""
+    spec = ENTITIES[entity]
+    data = ctx.client.get(f"{spec['path']}/{new_id}", params={"include": spec["include"]})
+    after = _extract_after(entity, data)
+    if after is None:
+        raise FSError(f"{spec['path']}/{new_id}: empty response on read-back")
+    return after
+
+
 def apply_create(ctx, plan):
     req = plan["request"]
-    response = ctx.client.post(req["path"], req["body"])
     entity = plan["entity"]
     spec = ENTITIES[entity]
+    # Ask for the extras back on the POST itself: the response is the saved record, so it can be
+    # verified without a second call.
+    response = ctx.client.post(req["path"], req["body"], params={"include": spec["include"]})
     new_id = (response.get(spec["key"]) or {}).get("id")
     if new_id is None:
         raise FSError(f"POST {req['path']}: response had no {spec['key']} id; check Freshsales before retrying")
     result = {"created_id": new_id, "url": f"{WEB_BASE}{spec['web']}/{new_id}"}
-    try:
-        after = _fetch_after(ctx, entity, new_id)
-    except FSError as exc:
-        return {**result, "status": "CREATED-UNVERIFIED", "error": str(exc), "verification": []}
+    after = _extract_after(entity, response)
+    if not _complete(response, after, plan["_checks"]):
+        try:
+            after = _fetch_after(ctx, entity, new_id)
+        except FSError as exc:
+            return {**result, "status": "CREATED-UNVERIFIED", "error": str(exc), "verification": []}
     rows = []
     for chk in plan["_checks"]:
         where, field = chk["where"]

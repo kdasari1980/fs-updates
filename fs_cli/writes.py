@@ -6,6 +6,7 @@ plan's payload, re-reads the record and checks every intended field took.
 """
 import re
 
+from . import checks as rules
 from . import reads, values
 from .client import FSError, NotFound
 
@@ -28,6 +29,8 @@ class Context:
         self._fields = {}
         self._stages = None
         self.seen = set()  # emails and names planned so far in this run (creates)
+        self.email_hits = {}      # lowercased email -> existing contacts, filled by one batched search
+        self.email_checked = set()  # emails that search has already covered
 
     def fields(self, entity):
         if entity not in self._fields:
@@ -139,6 +142,51 @@ def _owner_update(ctx, entity, fields_entity, value, current, errors, changes, p
 
 # ---------- plans ----------
 
+def _email_update(ctx, contact_id, current, value, errors, changes, payload, checks):
+    """Make `value` the primary email and keep the old addresses as secondary.
+
+    A PUT replaces the whole list (anything left out is removed), so every existing address is sent back.
+    """
+    new = str(value).strip()
+    if not values.EMAIL_RE.match(new):
+        errors.append(f"email: {value!r} is not a valid email address")
+        return
+    emails = current.get("emails") or []
+    existing = next((e for e in emails if (e.get("value") or "").lower() == new.lower()), None)
+    before = ", ".join(f"{e['value']}{' (primary)' if e.get('is_primary') else ''}" for e in emails) or None
+    if existing and existing.get("is_primary"):
+        changes.append(_change("email", before, before))
+        return
+    if not existing:
+        for hit in reads.contacts_by_email(ctx.client, new):
+            if str(hit["id"]) != str(contact_id):
+                errors.append(f"email: {new} already belongs to contact {hit['id']} ({hit.get('display_name')}). If "
+                              "that is a blank duplicate made by an email BCC, merge it with "
+                              f"merge-contacts {contact_id} --with {hit['id']}")
+    primary = ({"id": existing["id"], "value": existing["value"], "is_primary": True} if existing
+               else {"value": new, "is_primary": True})
+    others = [e for e in emails if e is not existing]
+    payload["emails"] = [primary] + [{"id": e["id"], "value": e["value"], "is_primary": False} for e in others]
+    after = f"{new} (primary)" + "".join(f", {e['value']}" for e in others)
+    ch = _change("email", before, after)
+    ch["overwrites_existing"] = any(e.get("is_primary") for e in emails)
+    changes.append(ch)
+    checks.append(("emails", "email", new, [e["value"] for e in emails]))
+
+
+def _contact_after(current, payload, custom):
+    """The contact as it will stand once the update is applied, for the rule checks."""
+    after = dict(current)
+    for k, v in payload.items():
+        if k not in ("custom_field", "emails", "sales_accounts"):
+            after[k] = v
+    after["custom_field"] = {**(current.get("custom_field") or {}), **custom}
+    if "emails" in payload:
+        after["emails"] = [{"value": e["value"]} for e in payload["emails"]]
+        after["email"] = payload["emails"][0]["value"]
+    return after
+
+
 def plan_update_contact(ctx, contact_id, sets):
     if not sets:
         raise FSError("update-contact needs at least one --set key=value")
@@ -157,6 +205,19 @@ def plan_update_contact(ctx, contact_id, sets):
                            errors, changes, custom, checks)
         elif key in ("owner", "owner_id"):
             _owner_update(ctx, "contact", "contacts", value, current, errors, changes, payload, checks)
+        elif key == "email":
+            _email_update(ctx, contact_id, current, value, errors, changes, payload, checks)
+        elif key == "subscription_types":
+            ids = [values.choice(ctx, "contacts", "subscription_types", part, errors, "contact")
+                   for part in values.split(value)]
+            ids = [str(i) for i in ids if i is not None]
+            if ids:
+                joined = ";".join(ids)
+                ch = _typed_change(key, current.get("subscription_types"), f"{value} ({joined})", "set", set(ids))
+                changes.append(ch)
+                if ch["changed"]:
+                    payload["subscription_types"] = joined
+                    checks.append(("std", key, f"{value} ({joined})", "set", set(ids)))
         elif key in CONTACT_ACCOUNT_KEYS:
             existing = current["sales_accounts"]
             before_names = [a.get("name") for a in existing]
@@ -187,13 +248,14 @@ def plan_update_contact(ctx, contact_id, sets):
             checks.append(("account", "sales_account", target))
         else:
             errors.append(f"{key}: not a supported contact field. Supported: "
-                          f"{list(CONTACT_STANDARD) + ['owner', 'sales_account', 'cf_*']}")
+                          f"{list(CONTACT_STANDARD) + ['email', 'owner', 'subscription_types', 'sales_account', 'cf_*']}")
 
     if custom:
         payload["custom_field"] = custom
     return {
         "op": "update-contact", "entity": "contact", "id": contact_id,
         "label": current.get("display_name"), "changes": changes, "errors": errors,
+        "warnings": [m for _, m in rules.contact_issues(_contact_after(current, payload, custom))],
         "request": {"method": "PUT", "path": f"contacts/{contact_id}",
                     "body": {"contact": payload}} if payload else None,
         "_checks": checks,
@@ -250,8 +312,8 @@ def plan_link_deal_contacts(ctx, deal_id, add, remove):
     both = sorted(set(add_ids) & set(remove_ids))
     if both:
         errors.append(f"contacts {both} are in both --add and --remove")
-    deal = reads.get_deal(ctx.client, deal_id)
-    linked = reads.deal_contacts(ctx.client, deal_id)
+    deal = reads.get_deal(ctx.client, deal_id)   # one call: the deal and its contacts together
+    linked = deal["contacts"]
     names = {c["id"]: c.get("display_name") for c in linked}
     linked_ids = [c["id"] for c in linked]
 
@@ -304,6 +366,43 @@ def _resolve_stage(ctx, name, pipeline_id):
     if len(matches) > 1:
         raise FSError(f"deal_stage: {name!r} is ambiguous across pipelines")
     return matches[0]
+
+
+def plan_update_account(ctx, account_id, sets):
+    """Rename an account, change its address, owner or custom fields (such as Account Type)."""
+    if not sets:
+        raise FSError("update-account needs at least one --set key=value")
+    current = reads.account_from({"sales_account": reads.get_account(ctx.client, account_id)["account"]})
+    errors, changes, payload, custom, checks = [], [], {}, {}, []
+    for key, value in sets.items():
+        if key in ACCOUNT_STANDARD:
+            ch = _change(key, current.get(key), value)
+            changes.append(ch)
+            if ch["changed"]:
+                payload[key] = value
+                checks.append(("std", key, value))
+            if key == "name" and ch["changed"] and not _empty(value):
+                for hit in reads.search(ctx.client, value.strip(), "sales_account"):
+                    if hit.get("type") == "sales_account" and str(hit.get("id")) != str(account_id) \
+                            and (hit.get("name") or "").strip().lower() == value.strip().lower():
+                        errors.append(f"name: another account is already called {hit.get('name')!r} (id {hit.get('id')})")
+        elif key.startswith("cf_"):
+            _custom_update(ctx, "account", "sales_accounts", key, value, current["custom_field"],
+                           errors, changes, custom, checks)
+        elif key in ("owner", "owner_id"):
+            _owner_update(ctx, "account", "sales_accounts", value, current, errors, changes, payload, checks)
+        else:
+            errors.append(f"{key}: not a supported account field. Supported: "
+                          f"{list(ACCOUNT_STANDARD) + ['owner', 'cf_*']}")
+    if custom:
+        payload["custom_field"] = custom
+    return {
+        "op": "update-account", "entity": "account", "id": account_id, "label": current.get("name"),
+        "changes": changes, "errors": errors, "warnings": [],
+        "request": {"method": "PUT", "path": f"sales_accounts/{account_id}",
+                    "body": {"sales_account": payload}} if payload else None,
+        "_checks": checks,
+    }
 
 
 def plan_update_deal(ctx, deal_id, sets):
@@ -372,50 +471,82 @@ def _strip_html(text):
     return re.sub(r"<[^>]+>", "", str(text or "")).strip()
 
 
+ACCOUNT_STANDARD = ("name", "website", "phone", "address", "city", "state", "zipcode", "country")
+
+# What a write is asked to send back (?include=) so it can be checked without a second call.
+WRITE_INCLUDES = {"update-contact": "sales_accounts,owner",
+                  "update-account": "owner",
+                  "update-deal": "sales_account,deal_stage,owner,contacts",
+                  "link-deal-contacts": "sales_account,deal_stage,owner,contacts"}
+
+
+def _record_has(response, plan, keys):
+    rec = (response or {}).get({"deal": "deal", "account": "sales_account"}.get(plan["entity"], "contact")) or {}
+    return all(k in rec for k in keys)
+
+
+def _after(ctx, plan, response):
+    """The saved record, taken from the write's own response. A GET happens only when the response
+    is missing something the checks need, so a verified write normally costs one call, not two."""
+    need = []
+    if any(c[0] == "cf" for c in plan["_checks"]):
+        need.append("custom_field")
+    if any(c[0] == "emails" for c in plan["_checks"]):
+        need.append("emails")
+    deal = plan["entity"] == "deal"
+    account = plan["entity"] == "account"
+    after = (reads.deal_from if deal else reads.account_from if account else reads.contact_from)(response or {})
+    complete = after is not None and _record_has(response, plan, need)
+    if plan["op"] == "link-deal-contacts":
+        rec = (response or {}).get("deal") or {}
+        complete = complete and ("contacts" in (response or {}) or "contacts" in rec)
+    if complete:
+        return after
+    if account:
+        return reads.account_from(ctx.client.get(f"sales_accounts/{plan['id']}", params={"include": "owner"}))
+    return (reads.get_deal if deal else reads.get_contact)(ctx.client, plan["id"])
+
+
 def _verify(ctx, plan, response):
     rows = []
     checks = plan["_checks"]
+    if plan["op"] == "add-note":
+        note = (response or {}).get("note") or {}
+        intended = checks[0][2]
+        if note.get("id") is not None and note.get("description") is not None:
+            # The POST echoes the saved note, so it costs nothing extra to check it.
+            actual = note["description"]
+        else:
+            path, _, key = NOTE_TARGETS[plan["entity"]]
+            data = ctx.client.get(f"{path}/{plan['id']}", params={"include": "notes"})
+            notes = reads._included(data, data.get(key) or {}, "note", "notes")
+            found = next((n for n in notes if str(n.get("id")) == str(note.get("id"))), None)
+            actual = found.get("description") if found else None
+        rows.append({"field": "note", "intended": intended, "actual": actual,
+                     "ok": actual is not None and _strip_html(actual) == intended.strip()})
+        return rows
+
+    after = _after(ctx, plan, response)
     if plan["op"] == "link-deal-contacts":
-        actual = [c["id"] for c in reads.deal_contacts(ctx.client, plan["id"])]
+        actual = [c["id"] for c in after["contacts"]]
         want = checks[0][2]
         return [{"field": "contacts", "intended": want, "actual": actual,
                  "ok": values.compare("exact", want, actual)}]
 
-    if plan["op"] == "add-note":
-        note_id = ((response or {}).get("note") or {}).get("id")
-        path, _, key = NOTE_TARGETS[plan["entity"]]
-        data = ctx.client.get(f"{path}/{plan['id']}", params={"include": "notes"})
-        notes = reads._included(data, data.get(key) or {}, "note", "notes")
-        found = next((n for n in notes if str(n.get("id")) == str(note_id)), None)
-        intended = checks[0][2]
-        row = {"field": "note", "intended": intended,
-               "actual": found.get("description") if found else None}
-        if found is None and not notes and note_id is not None:
-            # Contact read did not include notes at all; fall back to the POST echo.
-            row["actual"] = ((response or {}).get("note") or {}).get("description")
-            row["source"] = "POST response (notes not included on contact read)"
-        row["ok"] = row["actual"] is not None and _strip_html(row["actual"]) == intended.strip()
-        rows.append(row)
-        return rows
-
-    if plan["op"] == "update-contact":
-        after = reads.get_contact(ctx.client, plan["id"])
-    else:
-        after = reads.get_deal(ctx.client, plan["id"])
     for chk in checks:
         kind, field, intended = chk[:3]
-        if kind == "cf" and len(chk) > 3:
-            actual = after["custom_field"].get(field)
-            rows.append({"field": field, "intended": intended, "actual": actual,
-                         "ok": values.compare(chk[3], chk[4], actual)})
-        elif kind == "std":
-            actual = after.get(field)
-            rows.append({"field": field, "intended": intended, "actual": actual,
-                         "ok": same(field, actual, intended)})
-        elif kind == "cf":
-            actual = after["custom_field"].get(field)
-            rows.append({"field": field, "intended": intended, "actual": actual,
-                         "ok": same(field, actual, intended)})
+        if kind in ("std", "cf"):
+            actual = after.get(field) if kind == "std" else after["custom_field"].get(field)
+            ok = values.compare(chk[3], chk[4], actual) if len(chk) > 3 else same(field, actual, intended)
+            rows.append({"field": field, "intended": intended, "actual": actual, "ok": ok})
+        elif kind == "emails":
+            actual = [e["value"] for e in after.get("emails") or []]
+            primary = next((e["value"] for e in after.get("emails") or [] if e.get("is_primary")), None)
+            kept = all(old.lower() in {a.lower() for a in actual} for old in chk[3])
+            rows.append({"field": "email", "intended": f"{intended} (primary), old addresses kept",
+                         "actual": [f"{e['value']}{' (primary)' if e.get('is_primary') else ''}"
+                                    for e in after.get("emails") or []],
+                         "ok": (primary or "").lower() == intended.lower() and kept})
         elif kind == "account":
             accs = after["sales_accounts"]
             match = next((a for a in accs if str(a.get("id")) == str(intended["id"])), None)
@@ -432,10 +563,12 @@ def apply_plan(ctx, plan):
     req = plan["request"]
     if req is None:
         return {"status": "no-op", "verification": []}
+    include = WRITE_INCLUDES.get(plan["op"])
+    params = {"include": include} if include else None
     if req["method"] == "PUT":
-        response = ctx.client.put(req["path"], req["body"])
+        response = ctx.client.put(req["path"], req["body"], params=params)
     else:
-        response = ctx.client.post(req["path"], req["body"])
+        response = ctx.client.post(req["path"], req["body"], params=params)
     rows = _verify(ctx, plan, response)
     return {"status": "verified" if all(r["ok"] for r in rows) else "MISMATCH",
             "verification": rows}

@@ -6,6 +6,7 @@
 import re
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+EMAIL_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
 
 
 def empty(v):
@@ -24,6 +25,11 @@ def number(value):
         return float(text)
 
 
+def _stale_hint(ctx):
+    note = getattr(getattr(ctx, "client", None), "meta_note", None)
+    return note() if callable(note) else ""
+
+
 def choice(ctx, fields_entity, field, value, errors, noun):
     """Resolve a choice by its text or numeric id. Returns the id, or None after recording an error."""
     meta = ctx.fields(fields_entity).get(field)
@@ -38,7 +44,8 @@ def choice(ctx, fields_entity, field, value, errors, noun):
         return int(cid) if str(cid).isdigit() else cid
     names = [c.get("value") for c in choices]
     shown = names[:15] + (["..."] if len(names) > 15 else [])
-    errors.append(f"{field}: {value!r} is {'ambiguous' if hits else 'not a valid choice'}. Valid: {shown}")
+    errors.append(f"{field}: {value!r} is {'ambiguous' if hits else 'not a valid choice'}. Valid: {shown}"
+                  f"{_stale_hint(ctx)}")
     return None
 
 
@@ -65,7 +72,7 @@ def custom(ctx, fields_entity, field, value, errors, noun):
     text = str(value).strip()
     if ftype in ("dropdown", "radio"):
         if text not in valid:
-            errors.append(f"{field}: {value!r} is not a valid picklist value. Valid: {valid}")
+            errors.append(f"{field}: {value!r} is not a valid picklist value. Valid: {valid}{_stale_hint(ctx)}")
             return None
         return text, "text", text
     if ftype == "multi_select_dropdown":

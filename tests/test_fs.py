@@ -98,32 +98,58 @@ class TestRetry(unittest.TestCase):
 
 
 class TestReads(unittest.TestCase):
-    def test_lookup_found_and_not_found(self):
-        def lookup(params, _):
-            if params["q"] == "ada@example.com":
-                return {"contacts": {"contacts": [{"id": 11}]}}
-            return {"contacts": {"contacts": []}}
-        routes = {("GET", "lookup"): lookup, ("GET", "contacts/11"): contact_body()}
-        code, out, _, session = run(["lookup", "ada@example.com, nobody@example.com"], routes)
+    def test_lookup_batches_all_emails_into_one_search(self):
+        searches = []
+        def fsearch(params, body):
+            searches.append(body["filter_rule"][0]["value"])
+            return {"contacts": [{"id": 11, "display_name": "Ada Lovelace", "email": "ada@example.com",
+                                  "emails": [{"value": "ada@example.com"}, {"value": "ada@home.org"}]}],
+                    "meta": {"total": 1}}
+        routes = {("POST", "filtered_search/contact"): fsearch, ("GET", "contacts/11"): contact_body()}
+        code, out, _, session = run(["lookup", "ada@example.com, nobody@example.com, ADA@HOME.ORG"], routes)
         self.assertEqual(code, 0)
-        self.assertEqual(out[0]["status"], "found")
+        self.assertEqual(searches, ["ada@example.com,nobody@example.com,ADA@HOME.ORG"])   # ONE search for three emails
+        self.assertEqual([r["status"] for r in out], ["found", "not found", "found"])
         c = out[0]["contacts"][0]
         self.assertEqual(c["display_name"], "Ada Lovelace")
         self.assertEqual(c["sales_accounts"], [{"id": 100, "name": "Engines Ltd", "is_primary": True}])
         self.assertEqual(c["custom_field"], {"cf_rereachout": "No"})
         self.assertEqual(out[1], {"email": "nobody@example.com", "status": "not found"})
-        self.assertEqual(session.calls[0][2], {"q": "ada@example.com", "f": "email", "entities": "contact"})
+        # one search + one read of Ada; her second address does not cost a second read
+        self.assertEqual(len([c for c in session.calls if c[0] in ("GET", "POST")]), 2)
+
+    def test_lookup_brief_stops_after_the_search(self):
+        routes = {("POST", "filtered_search/contact"): {"contacts": [{"id": 11, "display_name": "Ada", "email": "ada@example.com",
+                                                                      "emails": [{"value": "ada@example.com"}]}],
+                                                        "meta": {"total": 1}}}
+        code, out, _, session = run(["lookup", "ada@example.com", "--brief"], routes)
+        self.assertEqual(out[0]["contacts"][0]["display_name"], "Ada")
+        self.assertEqual(len(session.calls), 1)
+
+    def test_lookup_falls_back_to_one_lookup_per_email_if_search_fails(self):
+        def lookup(params, _):
+            if params["q"] == "ada@example.com":
+                return {"contacts": {"contacts": [{"id": 11}]}}
+            return {"contacts": {"contacts": []}}
+        routes = {("POST", "filtered_search/contact"): FakeResponse(500, {"error_code": 500}),
+                  ("GET", "lookup"): lookup, ("GET", "contacts/11"): contact_body()}
+        code, out, _, session = run(["lookup", "ada@example.com, nobody@example.com"], routes)
+        self.assertEqual(code, 0)
+        self.assertEqual([r["status"] for r in out], ["found", "not found"])
+        self.assertEqual(session.calls[1][2], {"q": "ada@example.com", "f": "email", "entities": "contact"})
 
     def test_lookup_accounts_top_level(self):
         body = contact_body()
         body["contact"].pop("sales_accounts")
         body["sales_accounts"] = [{"id": 7, "name": "Top Ltd"}]
-        routes = {("GET", "lookup"): {"contacts": {"contacts": [{"id": 11}]}}, ("GET", "contacts/11"): body}
+        routes = {("POST", "filtered_search/contact"): {"contacts": [{"id": 11, "email": "ada@example.com"}],
+                                                        "meta": {"total": 1}},
+                  ("GET", "contacts/11"): body}
         _, out, _, _ = run(["lookup", "ada@example.com"], routes)
         self.assertEqual(out[0]["contacts"][0]["sales_accounts"], [{"id": 7, "name": "Top Ltd"}])
 
-    def test_find_deals(self):
-        routes = {
+    def deal_search_routes(self):
+        return {
             ("GET", "search"): [{"id": 5, "type": "deal", "name": "Acme deal"},
                                 {"id": 100, "type": "sales_account", "name": "Acme Ltd"}],
             ("GET", "deals/5"): {"deal": {"id": 5, "name": "Acme deal", "amount": "1000.0",
@@ -133,12 +159,31 @@ class TestReads(unittest.TestCase):
                                  "sales_accounts": [{"id": 100, "name": "Acme Ltd"}]},
             ("GET", "sales_accounts/100"): {"sales_account": {"id": 100, "name": "Acme Ltd"}},
         }
-        code, out, _, session = run(["find-deals", "Acme"], routes)
+
+    def test_find_deals_costs_one_call_per_term(self):
+        code, out, err, session = run(["find-deals", "Acme"], self.deal_search_routes())
         self.assertEqual(code, 0)
+        self.assertEqual(out[0]["deals"], [{"id": 5, "name": "Acme deal"}])
+        self.assertEqual(out[0]["sales_accounts"], [{"id": 100, "name": "Acme Ltd"}])
+        self.assertIn("--details", out[0]["details"])
+        self.assertEqual(len(session.calls), 1)                      # no per-hit reads
+        self.assertEqual(session.calls[0][2]["include"], "deal,sales_account")
+        self.assertIn("API calls this run: 1", err)
+
+    def test_find_deals_details_fetches_and_caps(self):
+        code, out, _, session = run(["find-deals", "Acme", "--details"], self.deal_search_routes())
         d = out[0]["deals"][0]
         self.assertEqual((d["stage"], d["amount"], d["sales_account"]["name"]), ("IM Received", "1000.0", "Acme Ltd"))
         self.assertEqual(out[0]["sales_accounts"][0]["name"], "Acme Ltd")
-        self.assertEqual(session.calls[0][2]["include"], "deal,sales_account")
+        self.assertEqual(len(session.calls), 3)                      # search + the deal + the account
+        routes = self.deal_search_routes()
+        routes[("GET", "search")] = [{"id": i, "type": "deal", "name": f"D{i}"} for i in range(1, 6)]
+        for i in range(1, 6):
+            routes[("GET", f"deals/{i}")] = {"deal": {"id": i, "name": f"D{i}"}}
+        code, out, _, session = run(["find-deals", "D", "--details", "--max-details", "2"], routes)
+        self.assertEqual(len(out[0]["deals"]), 2)
+        self.assertEqual([d["id"] for d in out[0]["deals_not_detailed"]], [3, 4, 5])
+        self.assertEqual(len(session.calls), 3)                      # search + 2 details, not 6
 
     def test_account(self):
         routes = {("GET", "sales_accounts/100"): {

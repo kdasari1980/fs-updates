@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run the real fs CLI, pointed at the local fake instead of tern.freshworks.com.
-cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)" && NO_PROXY=127.0.0.1 no_proxy=127.0.0.1 python3 -c '
+cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)" && FS_NO_CACHE=1 NO_PROXY=127.0.0.1 no_proxy=127.0.0.1 python3 -c '
 import sys, fs_cli.client as c
 c.Client.__init__.__defaults__ = ("http://127.0.0.1:8765/crm/sales/api/",) + c.Client.__init__.__defaults__[1:]
 from fs_cli.cli import main

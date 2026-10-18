@@ -5,12 +5,12 @@ LOG = sys.argv[2]
 PREFIX = "/crm/sales/api/"
 state = {
  "contact": {"id": 11, "display_name": "Ada Lovelace", "first_name": "Ada", "last_name": "Lovelace",
-             "email": "ada@example.com", "job_title": "CEO", "mobile_number": "", "linkedin": None,
+             "email": "ada@example.com", "emails": [{"id": 1, "value": "ada@example.com", "is_primary": True}], "job_title": "CEO", "mobile_number": "", "linkedin": None,
              "city": "London", "custom_field": {"cf_rereachout": "No"},
              "sales_accounts": [{"id": 100, "name": "Engines Ltd", "is_primary": True}]},
  "deal": {"id": 5, "name": "Engines deal", "amount": "100.0", "deal_stage_id": 9, "deal_pipeline_id": 1,
           "sales_account_id": 100, "custom_field": {}},
- "notes": [], "hits429": 0, "ignore_city": True, "deal_contacts": [11],
+ "notes": [], "hits429": 0, "ignore_city": True, "deal_contacts": [11], "gone": [],
 }
 OWNERS = [{"id": 1, "value": "Karthik Dasari"}, {"id": 2, "value": "Joanna Te"}]
 FIELDS = {"fields": [
@@ -96,16 +96,20 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, {"contacts": {"contacts": hit}})
             if path == "contacts/11":
                 out = {"contact": c}
-                if q.get("include") == "notes": out["notes"] = [n for n in state["notes"] if n.get("on", "Contact") == "Contact"]
+                inc = q.get("include", "").split(",")
+                if "notes" in inc: out["notes"] = [n for n in state["notes"] if n.get("on", "Contact") == "Contact"]
+                if "deals" in inc and 11 in state["deal_contacts"]:
+                    out["deals"] = [{"id": 5, "name": d["name"], "deal_stage_id": d["deal_stage_id"]}]
                 return self._send(200, out)
             if path in ("contacts/filters", "deals/filters", "sales_accounts/filters"):
                 return self._send(200, {"filters": [{"id": 1, "name": "All " + path.split("/")[0].title(), "is_default": True, "is_public": True}]})
             if path == "contacts/view/1":
                 rows = [dict(c, emails=[{"value": c["email"]}]) | {"owner_id": 1}]
                 return self._send(200, {"contacts": rows, "meta": {"total": len(rows), "total_pages": 1}})
-            if path == "contacts/12":
+            if path == "contacts/12" and 12 not in state["gone"]:
                 return self._send(200, {"contact": {"id": 12, "display_name": "Bob Babbage", "first_name": "Bob", "last_name": "Babbage",
-                                                    "email": "bob@example.com", "custom_field": {}}})
+                                                    "email": "bob@example.com", "custom_field": {},
+                                                    "emails": [{"id": 5, "value": "bob@example.com", "is_primary": True}]}})
             if path == "search":
                 hits = []
                 if "engines" in q.get("q", "").lower():
@@ -128,9 +132,13 @@ class H(BaseHTTPRequestHandler):
                                         "contacts": [{"id": 11, "display_name": c["display_name"], "email": c["email"]}],
                                         "deals": [{"id": 5, "name": d["name"], "amount": d["amount"], "deal_stage_id": d["deal_stage_id"]}]})
             if path == "selector/deal_stages":
-                return self._send(200, {"deal_stages": [{"id": 9, "name": "IM Received", "deal_pipeline_id": 1}, {"id": 10, "name": "LOI", "deal_pipeline_id": 1}]})
+                return self._send(200, {"deal_stages": [{"id": 9, "name": "IM Received", "deal_pipeline_id": 1}, {"id": 10, "name": "LOI", "deal_pipeline_id": 1},
+                                                        {"id": 11, "name": "04 Plan-Teaser/Suspect", "deal_pipeline_id": 1}, {"id": 18, "name": "18 Screened Out", "deal_pipeline_id": 1}]})
         if method == "PUT" and path == "contacts/11":
             upd = dict(body["contact"])
+            if "emails" in upd:                                    # a PUT replaces the whole list
+                c["emails"] = [dict(e, id=e.get("id", 90 + i)) for i, e in enumerate(upd.pop("emails"))]
+                c["email"] = next(e["value"] for e in c["emails"] if e["is_primary"])
             if state["ignore_city"]: upd.pop("city", None)   # simulate a field silently not taking
             c["custom_field"].update(upd.pop("custom_field", {}))
             c.update(upd); return self._send(200, {"contact": c})
@@ -141,6 +149,19 @@ class H(BaseHTTPRequestHandler):
             for i in upd.pop("contacts_removed_list", []):
                 if i in state["deal_contacts"]: state["deal_contacts"].remove(i)
             d.update(upd); return self._send(200, {"deal": d})
+        if method == "DELETE":
+            for coll in ("contacts", "deals", "sales_accounts"):
+                if path.startswith(coll + "/") and path.split("/")[1].isdigit():
+                    rid = int(path.split("/")[1])
+                    created[coll].pop(rid, None)
+                    if coll == "contacts": state["gone"].append(rid)
+                    return self._send(200, True)
+        if method == "POST" and path == "contacts/merge":
+            keep = body["primary_id"]
+            merged = {"id": keep, "display_name": c["display_name"] if keep == 11 else "Merged",
+                      "emails": [{"value": c["email"], "is_primary": True}] + [{"value": "bob@example.com", "is_primary": False}]}
+            for sid in body["secondary_ids"]: state["gone"].append(sid)
+            return self._send(200, {"contact": merged})
         if method == "POST" and path == "filtered_search/contact":
             rows = [c]
             for rule in body["filter_rule"]:
@@ -148,7 +169,7 @@ class H(BaseHTTPRequestHandler):
                 key = {"contact_email.email": "email"}.get(attr, attr)
                 rows = [r for r in rows if (rule["operator"] == "contains" and val in str(r.get(key, "")).lower())
                         or (rule["operator"] == "is_in" and str(r.get(key, "")).strip().lower() in val.split(","))]
-            return self._send(200, {"contacts": [{k: r.get(k) for k in ("id", "display_name", "email", "job_title", "city")} for r in rows],
+            return self._send(200, {"contacts": [{k: r.get(k) for k in ("id", "display_name", "email", "emails", "job_title", "city")} for r in rows],
                                     "meta": {"total": len(rows)}})
         if method == "POST" and path in ("contacts", "deals", "sales_accounts"):
             key = {"contacts": "contact", "deals": "deal", "sales_accounts": "sales_account"}[path]
@@ -162,4 +183,5 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self): self.handle_any("GET")
     def do_PUT(self): self.handle_any("PUT")
     def do_POST(self): self.handle_any("POST")
+    def do_DELETE(self): self.handle_any("DELETE")
 HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()

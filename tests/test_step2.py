@@ -108,8 +108,8 @@ class TestUpdateContactCustomFields(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("owner_id: 'Nobody' is not a valid choice", err)
 
-    def test_email_is_still_unsupported_on_update(self):
-        code, _, err, _ = run(["update-contact", "11", "--set", "email=x@y.z"], contact_routes())
+    def test_unknown_key_is_still_rejected(self):
+        code, _, err, _ = run(["update-contact", "11", "--set", "favourite_colour=red"], contact_routes())
         self.assertEqual(code, 1)
         self.assertIn("not a supported contact field", err)
 
@@ -202,25 +202,19 @@ class TestNotesOnAnyRecord(unittest.TestCase):
 
 
 class TestLinkDealContacts(unittest.TestCase):
-    def routes(self, linked_after=None, captured=None):
-        def put(_, body):
+    def routes(self, linked_after=None, captured=None, put_response=None):
+        """Deal 5 starts with contacts 1 and 2. After a PUT, reads show `linked_after` (default: unchanged)."""
+        state = {"put": False}
+        def put(params, body):
+            state["put"] = True
             if captured is not None:
-                captured.append(body)
-            return {"deal": {}}
+                captured.append((params, body))
+            return put_response if put_response is not None else {"deal": {}}
         def deal_get(p, b):
-            inc = (p or {}).get("include", "")
-            if inc == "contacts":
-                return {"deal": deal(), "contacts": [{"id": i, "display_name": f"C{i}"} for i in current()]}
-            return {"deal": deal()}
-        state = {"n": 0}
-        def current():
-            # first read is the plan; later reads (verification) can differ
-            if linked_after is not None and state["n"] >= 1:
-                return linked_after
-            state["n"] += 1
-            return [1, 2]
+            ids = linked_after if (linked_after is not None and state["put"]) else [1, 2]
+            return {"deal": deal(), "contacts": [{"id": i, "display_name": f"C{i}"} for i in ids]}
         return {("GET", "deals/5"): deal_get, ("PUT", "deals/5"): put,
-                ("GET", "contacts/3"): contact(id=3)["contact"] and {"contact": {"id": 3, "display_name": "Cee"}},
+                ("GET", "contacts/3"): {"contact": {"id": 3, "display_name": "Cee"}},
                 ("GET", "settings/deals/fields"): DEAL_META}
 
     def test_only_the_changes_are_sent(self):
@@ -233,6 +227,8 @@ class TestLinkDealContacts(unittest.TestCase):
         self.assertFalse(rows["contact 2"]["changed"])           # already linked
         self.assertTrue(rows["contact 1"]["overwrites_existing"])  # removal is flagged
         self.assertIn("contact 3", rows)
+        # the deal and its contacts come from ONE read, not two
+        self.assertEqual(len([c for c in session.calls if c[:2] == ("GET", "deals/5")]), 1)
 
     def test_nothing_to_do_is_a_noop(self):
         code, out, err, _ = run(["link-deal-contacts", "5", "--add", "1,2", "--apply"], self.routes())
@@ -263,17 +259,27 @@ class TestLinkDealContacts(unittest.TestCase):
         _, out, err, _ = run(["link-deal-contacts", "5", "--remove", "1,2"], self.routes())
         self.assertIn("left with no contacts", err)
 
-    def test_apply_verifies_the_exact_final_set(self):
+    def test_apply_verifies_from_the_put_response_without_another_read(self):
         captured = []
-        code, out, err, _ = run(["link-deal-contacts", "5", "--add", "3", "--remove", "1", "--apply"],
-                                self.routes(linked_after=[2, 3], captured=captured))
+        response = {"deal": deal(), "contacts": [{"id": 2}, {"id": 3}]}
+        code, out, err, session = run(["link-deal-contacts", "5", "--add", "3", "--remove", "1", "--apply"],
+                                      self.routes(captured=captured, put_response=response))
         self.assertEqual(code, 0, err)
         self.assertEqual(out["operations"][0]["result"]["status"], "verified")
-        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][0], {"include": "sales_account,deal_stage,owner,contacts"})
+        self.assertEqual(len([c for c in session.calls if c[:2] == ("GET", "deals/5")]), 1)   # only the planning read
+
+    def test_apply_falls_back_to_one_read_when_the_response_lacks_contacts(self):
+        code, out, err, session = run(["link-deal-contacts", "5", "--add", "3", "--remove", "1", "--apply"],
+                                      self.routes(linked_after=[2, 3]))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out["operations"][0]["result"]["status"], "verified")
+        self.assertEqual(len([c for c in session.calls if c[:2] == ("GET", "deals/5")]), 2)   # plan + one verification read
 
     def test_apply_flags_a_removal_that_did_not_happen(self):
+        response = {"deal": deal(), "contacts": [{"id": 1}, {"id": 2}, {"id": 3}]}
         code, out, err, _ = run(["link-deal-contacts", "5", "--add", "3", "--remove", "1", "--apply"],
-                                self.routes(linked_after=[1, 2, 3]))
+                                self.routes(put_response=response))
         self.assertEqual(code, 1)
         self.assertIn("DID NOT TAKE", err)
 
@@ -287,10 +293,6 @@ class TestLinkDealContacts(unittest.TestCase):
             self.assertEqual(out["operations"][0]["request"]["body"]["deal"]["contacts_added_list"], [3])
         finally:
             os.unlink(path)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestRealWorldFormats(unittest.TestCase):
@@ -329,3 +331,45 @@ class TestRealWorldFormats(unittest.TestCase):
                                  "--set", "cf_rereachout=Chase", "--apply"], routes)
         self.assertEqual(code, 0, err)
         self.assertEqual(out["operations"][0]["result"]["status"], "verified")
+
+
+class TestUpdateAccount(unittest.TestCase):
+    from tests.test_creates import ACCOUNT_META
+
+    def routes(self, put=None, search_hits=None):
+        acct = {"sales_account": {"id": 100, "name": "Debretts", "city": "London", "owner_id": 1,
+                                  "custom_field": {"cf_type": "SO-CF"}},
+                "contacts": [{"id": 1, "display_name": "A"}], "deals": []}
+        return {("GET", "settings/sales_accounts/fields"): self.ACCOUNT_META, ("GET", "sales_accounts/100"): acct,
+                ("GET", "search"): lambda p, b: search_hits or [], ("PUT", "sales_accounts/100"): put or {"sales_account": {}}}
+
+    def test_rename_and_multi_select(self):
+        code, out, err, session = run(["update-account", "100", "--set", "name=Debrett's",
+                                       "--set", "cf_type=SO-CF;AD-A&T", "--set", "owner=Joanna Te"], self.routes())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out["operations"][0]["request"]["body"]["sales_account"],
+                         {"name": "Debrett's", "owner_id": 2, "custom_field": {"cf_type": "SO-CF;AD-A&T"}})
+        self.assertEqual(session.writes(), [])
+
+    def test_a_name_another_account_has_is_refused(self):
+        hits = [{"id": 7, "type": "sales_account", "name": "DEBRETT'S"}]
+        code, _, err, _ = run(["update-account", "100", "--set", "name=Debrett's"], self.routes(search_hits=hits))
+        self.assertEqual(code, 1)
+        self.assertIn("another account is already called", err)
+
+    def test_apply_verifies_from_the_put_response_with_one_read(self):
+        saved = {"sales_account": {"id": 100, "name": "Debrett's", "owner_id": 1, "custom_field": {"cf_type": "SO-CF"}}}
+        code, out, err, session = run(["update-account", "100", "--set", "name=Debrett's", "--apply"], self.routes(put=saved))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out["operations"][0]["result"]["status"], "verified")
+        self.assertEqual(len([c for c in session.calls if c[0] == "GET" and c[1] == "sales_accounts/100"]), 1)
+        put = [c for c in session.calls if c[0] == "PUT"][0]
+        self.assertEqual(put[2], {"include": "owner"})
+
+    def test_unknown_key_and_ignored_change(self):
+        code, _, err, _ = run(["update-account", "100", "--set", "favourite=x"], self.routes())
+        self.assertEqual(code, 1)
+        ignored = {"sales_account": {"id": 100, "name": "Debretts", "custom_field": {}}}
+        code, _, err, _ = run(["update-account", "100", "--set", "name=Debrett's", "--apply"], self.routes(put=ignored))
+        self.assertEqual(code, 1)
+        self.assertIn("DID NOT TAKE", err)

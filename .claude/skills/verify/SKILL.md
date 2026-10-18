@@ -41,3 +41,10 @@ Search flows (read-only): `views`, `views --entity deals`, `list-view 1 --where 
 `find-contacts --name "Ada Lovelace"`, `find-contacts --name Love`, `find-contacts --city London --type ...`.
 The fake only has contact 11 (Ada, London). `POST filtered_search/contact` is a read, so it may appear in the
 request log on a dry-run.
+
+Step 3 flows: `update-contact 11 --set email=new@example.com` dry-run then `--apply` (old address stays secondary),
+`delete-contact 11` (refused: contact 11 is on deal 5, which is live; unlink first with
+`link-deal-contacts 5 --remove 11 --apply`, then `delete-contact 11 --apply`), `delete-contact 12 --apply`,
+`merge-contacts 11 --with 12` dry-run then `--apply`, `check-contacts --ids 11`, `lookup a@x.com,b@x.com --brief`.
+Every run ends with an `API calls this run: N` line on stderr; the fsl wrapper sets FS_NO_CACHE=1 so fake metadata
+never reaches the real on-disk cache.
