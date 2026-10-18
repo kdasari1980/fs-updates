@@ -72,6 +72,13 @@ def lookup(client, emails):
     return results
 
 
+def contacts_by_email(client, email):
+    """Contacts whose email matches exactly: [{id, display_name}, ...]. Search lags new records by minutes."""
+    data = client.get("lookup", params={"q": email, "f": "email", "entities": "contact"})
+    return [{"id": m.get("id"), "display_name": m.get("display_name")}
+            for m in (data.get("contacts") or {}).get("contacts") or []]
+
+
 # ---------- deals / accounts ----------
 
 def get_deal(client, deal_id):

@@ -26,4 +26,9 @@ picklists, lookup (found + not found), find-deals Engines, account 100 / 999,
 update-contact dry-run then --apply, invalid picklist with --apply (0 PUTs),
 update-deal deal_stage=LOI --apply (429 retry), add-note dry/apply, --batch with one invalid item.
 
+Creates: `create-contact --preset target-contact --set first_name=Zed --set email=zed@example.com` dry-run then
+`--apply` (verified), the same again (duplicate blocks it), an email containing `ghost` (the fake drops
+`subscription_types`, so verification reports DID NOT TAKE), `create-deal --preset target-deal --set name=X --set contacts=11 --apply`,
+`create-account --preset advisor-account --set name=X --set 'cf_type=SO-CF;AD-A&T' --apply`. The fake keeps what POST creates (ids from 60).
+
 Gotcha: `pkill -f fake_fs.py` from the same shell line can kill that shell (exit 144); use `kill %1`.

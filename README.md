@@ -107,6 +107,50 @@ Supported deal keys: `name`, `amount`, `expected_close`, `probability`, `deal_st
 name, resolved within the deal's pipeline), `sales_account` (exact name), and any `cf_*` field
 that exists on deals. Dropdown values are validated.
 
+### Create commands
+
+```bash
+./fs create-contact --preset target-contact --set first_name=Ada --set last_name=Lovelace \
+    --set email=ada@example.com --set job_title=CEO --set city=Reading        # dry-run
+./fs create-deal    --preset target-deal --set name="Acme Software" --set contacts=70001234567
+./fs create-account --preset advisor-account --set name="Acme Advisers LLP" --set "cf_type=SO-CF;AD-A&T"
+```
+Dry-run by default, like every write. A create plan is validated against the live field settings and
+checked for duplicates before anything is sent. `--apply` then POSTs, re-reads the new record and prints
+`field / intended / actual`, the new id and a Freshsales link. It exits 1 on any mismatch.
+
+**Presets** carry the `fs-update` skill's defaults. They appear in the diff marked `default`, any `--set`
+overrides them, and they are validated against the live picklists like every other value:
+
+| Preset | Sets |
+|---|---|
+| `target-contact` | owner Karthik Dasari, lifecycle Lead, status Unqualified Leads, type `TG-Owner/Manager`, final status `Unqualified`, reachout `Chase`, subscription Deal Announcements, account `Not Qualified` |
+| `advisor-contact` | owner Karthik Dasari, reachout `Chase`, final status `Unqualified` (you give type, priority and account) |
+| `target-deal` | amount -1, owner Karthik Dasari, pipeline All Tern Deals, stage `04 Plan-Teaser/Suspect`, `10 Suspect`, Chase, Direct, Healthy, Standalone, Bolt-on Yes / Other, GBP |
+| `advisor-account` | owner Karthik Dasari |
+
+Keys:
+* **Contact:** `first_name` (required), `last_name`, `email` / `emails` (`;` or `,` separated, the first is primary; an email or `mobile_number` is required), `job_title`, `mobile_number`, `work_number`, `linkedin`, `city`, `country`, `address`, `state`, `zipcode`, `owner`, `lifecycle_stage`, `contact_status`, `lead_source`, `territory`, `subscription_types` (names or ids, `;` separated), `sales_account` (exact name, made primary), any `cf_*`.
+* **Deal:** `name` and `amount` (required), `expected_close`, `probability`, `owner`, `stage` / `deal_stage`, `pipeline`, `currency`, `lead_source`, `territory`, `sales_account` (exact name), `contacts` (existing contact ids, comma separated), any `cf_*`.
+* **Account:** `name` (required), `website`, `phone`, `address`, `city`, `state`, `zipcode`, `country`, `annual_revenue`, `owner`, `industry_type`, `business_type`, `territory`, any `cf_*`.
+* Choice fields (`owner`, `stage`, ...) take the name or the numeric id. Custom fields are checked by type: dropdowns against their choices, multi-selects value by value, checkboxes `true`/`false`, numbers and `YYYY-MM-DD` dates. Types that can't be set from text (`auto_complete`, such as `cf_reports_to`) are rejected.
+
+**Duplicates.** A contact whose email already exists, or an account or deal whose name exactly matches an
+existing one (ignoring case), is an error and blocks the whole batch. Look-alikes (the name without
+trailing Ltd/Group/etc.) are warnings. The search index lags new records by a few minutes, so a record
+created moments ago is not seen by the duplicate check. Duplicates inside one batch are caught.
+
+Facts confirmed against the live API with throwaway records (all deleted afterwards):
+* dropdown, radio and checkbox custom fields accept their text values;
+* a multi-select (`cf_type`) needs one `;`-joined string. A list or comma string silently drops values;
+* a contact can be linked to an account at creation (`sales_accounts`), and a deal to contacts (`contacts_added_list`);
+* `subscription_types` takes a `;`-joined string of ids;
+* owner, lifecycle stage, contact status and currency only show on a read-back with
+  `?include=owner,lifecycle_stage,contact_status,currency`, so the verification asks for them.
+
+A batch is `[{"preset": "advisor-contact", "set": {...}}, ...]` (no id). Creates in one batch cannot refer to
+each other: create the contacts first, then the deal with `contacts=<ids>`.
+
 ### Batch
 
 Each write command accepts `--batch FILE`. FILE holds a JSON list of operations (or `{"operations": [...]}`).
@@ -150,6 +194,7 @@ Checked against https://developers.freshworks.com/crm/api/:
 | Account | `GET sales_accounts/{id}?include=contacts,deals` |
 | Fields/picklists | `GET settings/{contacts,sales_accounts,deals}/fields` (`choices[].value`) |
 | Deal stages | `GET selector/deal_stages` |
+| Create | `POST contacts` / `POST deals` / `POST sales_accounts` `{"contact": {...}}`, read back with `GET <path>/{id}?include=...` |
 | Note | `POST notes` `{"note": {"description", "targetable_type": "Contact", "targetable_id"}}` |
 
 The docs don't say where included associations appear in the response (inside the record or at the

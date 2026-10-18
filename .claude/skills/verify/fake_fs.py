@@ -12,11 +12,58 @@ state = {
           "sales_account_id": 100, "custom_field": {}},
  "notes": [], "hits429": 0, "ignore_city": True,
 }
+OWNERS = [{"id": 1, "value": "Karthik Dasari"}, {"id": 2, "value": "Joanna Te"}]
 FIELDS = {"fields": [
- {"name": "cf_rereachout", "label": "Re-reachout", "type": "dropdown", "choices": [{"id": 1, "value": "Yes"}, {"id": 2, "value": "No"}]},
- {"name": "cf_contact_type_newct", "label": "Contact type", "type": "dropdown", "choices": [{"id": 3, "value": "Owner"}]},
+ {"name": "cf_rereachout", "label": "Re-reachout", "type": "dropdown",
+  "choices": [{"id": 1, "value": "Yes"}, {"id": 2, "value": "No"}, {"id": 4, "value": "Chase"}]},
+ {"name": "cf_contact_type_newct", "label": "Contact type", "type": "dropdown",
+  "choices": [{"id": 3, "value": "Owner"}, {"id": 7, "value": "TG-Owner/Manager"}, {"id": 8, "value": "SO-CF"}]},
  {"name": "cf_reachout_final_statustargets", "label": "Final status", "type": "dropdown",
-  "choices": [{"id": 5, "value": "Meeting Done VC"}, {"id": 6, "value": "No Response"}]}]}
+  "choices": [{"id": 5, "value": "Meeting Done VC"}, {"id": 6, "value": "No Response"}, {"id": 9, "value": "Unqualified"}]},
+ {"name": "first_name", "type": "text", "required": True},
+ {"name": "owner_id", "type": "dropdown", "choices": OWNERS},
+ {"name": "lifecycle_stage_id", "type": "dropdown", "choices": [{"id": "70", "value": "Lead"}]},
+ {"name": "contact_status_id", "type": "dropdown", "choices": [{"id": 71, "value": "Unqualified Leads"}]},
+ {"name": "subscription_types", "type": "multi_select_dropdown",
+  "choices": [{"id": "1", "value": "Non-marketing emails"}, {"id": "2", "value": "Deal Announcements"}]}]}
+def _dd(name, *values):
+    return {"name": name, "type": "dropdown", "choices": [{"id": i + 1, "value": v} for i, v in enumerate(values)]}
+DEAL_FIELDS = {"fields": [
+ {"name": "owner_id", "type": "dropdown", "choices": OWNERS},
+ {"name": "deal_pipeline_id", "type": "dropdown", "choices": [{"id": 1, "value": "All Tern Deals"}]},
+ {"name": "deal_stage_id", "type": "dropdown", "choices": [{"id": 9, "value": "IM Received"}, {"id": 10, "value": "LOI"},
+                                                          {"id": 11, "value": "04 Plan-Teaser/Suspect"}]},
+ {"name": "currency_id", "type": "dropdown", "choices": [{"id": 303, "value": "GBP"}]},
+ _dd("cf_status", "Healthy", "Distressed"), _dd("cf_deal_currency", "GBP", "EUR"),
+ _dd("cf_deal_stagelatest", "10 Suspect"), _dd("cf_chaser_status", "Chase"), _dd("cf_source_deal", "Direct"),
+ _dd("cf_deal_type", "Standalone"), _dd("cf_bolton_only", "Yes", "No"), _dd("cf_bolton_platform", "Other")]}
+ACCOUNT_FIELDS = {"fields": [
+ {"name": "name", "type": "text", "required": True},
+ {"name": "owner_id", "type": "dropdown", "choices": OWNERS},
+ {"name": "cf_type", "type": "multi_select_dropdown", "choices": [{"id": 1, "value": "SO-CF"}, {"id": 2, "value": "AD-A&T"}]}]}
+created = {"contacts": {}, "deals": {}, "sales_accounts": {}}   # records made by POST
+next_id = [60]
+def readback(coll, key, rec, include):
+    """Echo a created record the way Freshsales does: owner, lifecycle, status, currency only via ?include=."""
+    out = {k: v for k, v in rec.items() if k not in ("owner_id", "lifecycle_stage_id", "contact_status_id",
+                                                     "currency_id", "contacts_added_list", "sales_accounts",
+                                                     "custom_field")}
+    out["custom_field"] = dict(rec.get("custom_field", {}))
+    if "ghost" in str(rec.get("emails")):               # simulate a field that silently does not take
+        out.pop("subscription_types", None)
+    body = {key: out}
+    inc = include.split(",")
+    if "owner" in inc and rec.get("owner_id") is not None: out["owner_id"] = rec["owner_id"]
+    if key == "contact":
+        out["sales_accounts"] = rec.get("sales_accounts", [])
+        if "lifecycle_stage" in inc and rec.get("lifecycle_stage_id"): body["lifecycle_stages"] = [{"id": rec["lifecycle_stage_id"]}]
+        if "contact_status" in inc and rec.get("contact_status_id"): body["contact_status"] = [{"id": rec["contact_status_id"]}]
+    if key == "deal":
+        body["contacts"] = [{"id": i} for i in rec.get("contacts_added_list", [])]
+        if "currency" in inc and rec.get("currency_id"): body["currencies"] = [{"id": rec["currency_id"]}]
+    return body
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def _send(self, code, body, headers=None):
@@ -37,9 +84,15 @@ class H(BaseHTTPRequestHandler):
             state["hits429"] += 1; return self._send(429, {"message": "slow down"}, {"Retry-After": "1"})
         if method == "GET":
             if path == "settings/contacts/fields": return self._send(200, FIELDS)
-            if path in ("settings/sales_accounts/fields", "settings/deals/fields"): return self._send(200, {"fields": []})
+            if path == "settings/sales_accounts/fields": return self._send(200, ACCOUNT_FIELDS)
+            if path == "settings/deals/fields": return self._send(200, DEAL_FIELDS)
+            for coll, key in (("contacts", "contact"), ("deals", "deal"), ("sales_accounts", "sales_account")):
+                if path.startswith(coll + "/") and path[len(coll) + 1:].isdigit() and int(path[len(coll) + 1:]) in created[coll]:
+                    return self._send(200, readback(coll, key, created[coll][int(path[len(coll) + 1:])], q.get("include", "")))
             if path == "lookup":
                 hit = [{"id": 11}] if q.get("q") == c["email"] else []
+                hit += [{"id": i, "display_name": r["first_name"]} for i, r in created["contacts"].items()
+                        if any(e["value"] == q.get("q") for e in r.get("emails", []))]
                 return self._send(200, {"contacts": {"contacts": hit}})
             if path == "contacts/11":
                 out = {"contact": c}
@@ -51,6 +104,8 @@ class H(BaseHTTPRequestHandler):
                     hits = [{"id": 5, "type": "deal", "name": d["name"]}, {"id": 100, "type": "sales_account", "name": "Engines Ltd"}]
                 if q.get("q") == "New Co":
                     hits = [{"id": 200, "type": "sales_account", "name": "New Co"}]
+                if q.get("q") == "Not Qualified":
+                    hits = [{"id": 9, "type": "sales_account", "name": "Not Qualified"}]
                 return self._send(200, hits)
             if path == "deals/5":
                 return self._send(200, {"deal": d, "deal_stages": [{"id": d["deal_stage_id"], "name": {9: "IM Received", 10: "LOI"}[d["deal_stage_id"]]}],
@@ -68,6 +123,11 @@ class H(BaseHTTPRequestHandler):
             c.update(upd); return self._send(200, {"contact": c})
         if method == "PUT" and path == "deals/5":
             d.update(body["deal"]); return self._send(200, {"deal": d})
+        if method == "POST" and path in ("contacts", "deals", "sales_accounts"):
+            key = {"contacts": "contact", "deals": "deal", "sales_accounts": "sales_account"}[path]
+            rec = dict(body[key]); rec["id"] = next_id[0]; next_id[0] += 1
+            created[path][rec["id"]] = rec
+            return self._send(200, {key: {"id": rec["id"]}})
         if method == "POST" and path == "notes":
             n = {"id": 77 + len(state["notes"]), "description": body["note"]["description"]}
             state["notes"].append(n); return self._send(201, {"note": n})

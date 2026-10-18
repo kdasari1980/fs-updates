@@ -23,6 +23,7 @@ class Context:
         self.client = client
         self._fields = {}
         self._stages = None
+        self.seen = set()  # emails and names planned so far in this run (creates)
 
     def fields(self, entity):
         if entity not in self._fields:

@@ -3,7 +3,7 @@ import argparse
 import json
 import sys
 
-from . import reads, writes
+from . import creates, reads, writes
 from .client import Client, FSError, load_api_key
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
@@ -41,14 +41,19 @@ def _table(headers, rows):
 
 
 def _print_diff(plan):
-    print(f"\n== {plan['op']} {plan['entity']} {plan['id']} ({plan.get('label') or '?'}) ==",
+    ident = "(new)" if plan["id"] is None else plan["id"]
+    print(f"\n== {plan['op']} {plan['entity']} {ident} ({plan.get('label') or '?'}) ==",
           file=sys.stderr)
     rows = []
     for ch in plan["changes"]:
         flag = "OVERWRITE" if ch["overwrites_existing"] else ("change" if ch["changed"] else "same")
+        if ch.get("source") == "default":
+            flag = "default"
         rows.append([ch["field"], _fmt(ch["before"]), _fmt(ch["after"]), flag])
     if rows:
         print(_table(["field", "before", "after", ""], rows), file=sys.stderr)
+    for w in plan.get("warnings", []):
+        print(f"  WARNING: {w}", file=sys.stderr)
     for e in plan["errors"]:
         print(f"  INVALID: {e}", file=sys.stderr)
 
@@ -56,7 +61,10 @@ def _print_diff(plan):
 def _print_verification(plan, result):
     rows = [[r["field"], _fmt(r["intended"]), _fmt(r["actual"]), "ok" if r["ok"] else "DID NOT TAKE"]
             for r in result["verification"]]
-    print(f"\n-- verification {plan['entity']} {plan['id']}: {result['status']} --", file=sys.stderr)
+    ident = result.get("created_id", plan["id"])
+    print(f"\n-- verification {plan['entity']} {ident}: {result['status']} --", file=sys.stderr)
+    if result.get("url"):
+        print(f"   {result['url']}", file=sys.stderr)
     if rows:
         print(_table(["field", "intended", "actual", ""], rows), file=sys.stderr)
 
@@ -74,9 +82,12 @@ def _load_batch(path, op):
     if not isinstance(data, list):
         raise FSError("batch file must be a JSON list of operations")
     ops = []
+    is_create = op.startswith("create-")
     for i, item in enumerate(data):
-        if not isinstance(item, dict) or "id" not in item:
+        if not isinstance(item, dict) or (not is_create and "id" not in item):
             raise FSError(f"batch item {i}: must be an object with an 'id'")
+        if is_create and not isinstance(item.get("set", {}), dict):
+            raise FSError(f"batch item {i}: 'set' must be an object")
         if item.get("op", op) != op:
             raise FSError(f"batch item {i}: op {item.get('op')!r} does not match command {op!r}")
         ops.append(item)
@@ -84,6 +95,12 @@ def _load_batch(path, op):
 
 
 def _collect_ops(args, op):
+    if op.startswith("create-"):
+        if args.batch:
+            if args.set or args.preset:
+                raise FSError("give either --set/--preset or --batch, not both")
+            return _load_batch(args.batch, op)
+        return [{"set": writes.parse_sets(args.set), "preset": args.preset}]
     if args.batch:
         if getattr(args, "id", None):
             raise FSError("give either an id or --batch, not both")
@@ -98,6 +115,9 @@ def _collect_ops(args, op):
 
 
 def _plan(ctx, op, item):
+    if op.startswith("create-"):
+        sets = {k: str(v) for k, v in (item.get("set") or {}).items()}
+        return creates.plan_create(ctx, op.split("-")[1], sets, item.get("preset"))
     if op == "update-contact":
         sets = item.get("set")
         if not isinstance(sets, dict):
@@ -121,7 +141,7 @@ def run_write(client, args, op):
             plan = _plan(ctx, op, item)
         except FSError as exc:
             plan = {"op": op, "entity": op.split("-")[1], "id": item.get("id"), "label": None,
-                    "changes": [], "errors": [str(exc)], "request": None, "_checks": []}
+                    "changes": [], "errors": [str(exc)], "warnings": [], "request": None, "_checks": []}
         plans.append(plan)
         _print_diff(plan)
         failed = failed or bool(plan["errors"])
@@ -139,13 +159,16 @@ def run_write(client, args, op):
     results, ok = [], True
     for plan in plans:
         try:
-            res = writes.apply_plan(ctx, plan)
+            res = (creates.apply_create(ctx, plan) if plan["op"].startswith("create-")
+                   else writes.apply_plan(ctx, plan))
         except FSError as exc:
             res = {"status": "error", "error": str(exc), "verification": []}
             _err(f"{plan['op']} {plan['id']}: {exc}")
         if res["verification"]:
             _print_verification(plan, res)
         ok = ok and res["status"] in ("verified", "no-op")
+        if res["status"] == "CREATED-UNVERIFIED":
+            _err(f"{plan['op']}: created as {res['created_id']} but the read-back failed: {res.get('error')}")
         results.append({**writes.public(plan), "result": res})
     _emit({"mode": "apply", "sent": True, "operations": results})
     return EXIT_OK if ok else EXIT_FAIL
@@ -170,6 +193,13 @@ def build_parser():
         s.add_argument("id", nargs="?")
         s.add_argument("--set", action="append", metavar="KEY=VALUE", default=[])
         s.add_argument("--batch", metavar="FILE", help="JSON list of {id, set} operations")
+        s.add_argument("--apply", action="store_true", help="actually write")
+    for entity in ("contact", "deal", "account"):
+        s = sub.add_parser(f"create-{entity}", help=f"create a {entity} (dry-run unless --apply)")
+        s.add_argument("--set", action="append", metavar="KEY=VALUE", default=[])
+        s.add_argument("--preset", choices=creates.preset_names(entity),
+                       help="skill defaults, shown in the diff as 'default'; --set overrides them")
+        s.add_argument("--batch", metavar="FILE", help='JSON list of {"set": {...}, "preset": "..."}')
         s.add_argument("--apply", action="store_true", help="actually write")
     s = sub.add_parser("add-note", help="add a note to a contact (dry-run unless --apply)")
     s.add_argument("id", nargs="?")
